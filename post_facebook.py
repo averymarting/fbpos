@@ -54,77 +54,106 @@ async def post_on_facebook(message: str = "Hello testing"):
             timezone_id="Asia/Karachi",
         )
 
-        # Load cookies
         if Path(COOKIES_TXT).exists():
             cookies = load_netscape_cookies(COOKIES_TXT)
             await context.add_cookies(cookies)
         else:
-            print(f"❌ {COOKIES_TXT} not found!")
+            print("❌ Cookies file not found!")
             await browser.close()
             return
 
         page = await context.new_page()
-        
+
+        # === 1. Open Facebook & Check Login ===
         print("🌐 Opening Facebook...")
         await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=30000)
         await asyncio.sleep(8)
-        await page.screenshot(path="01_facebook_home.png")
+        await page.screenshot(path="01_login_check.png")
 
-        print("🔄 Trying to open create post dialog...")
-
-        # Try multiple ways to open post composer
+        # Check if logged in
+        logged_in = False
         try:
-            post_selectors = [
-                'div[role="button"]:has-text("What\'s on your mind?")',
-                'span:has-text("What\'s on your mind?")',
-                '[aria-label="Create a post"]',
-                'div.x1i10hfl.x1q0g3np'  # Common class pattern
-            ]
-            
-            for selector in post_selectors:
-                try:
-                    post_box = await page.wait_for_selector(selector, timeout=8000)
-                    if post_box:
-                        await post_box.click()
-                        print(f"✅ Clicked post box using: {selector}")
-                        break
-                except:
-                    continue
-            await asyncio.sleep(5)
-            await page.screenshot(path="02_post_box_opened.png")
-        except Exception as e:
-            print(f"⚠️ Failed to open post box: {e}")
+            if await page.locator("text=What's on your mind?").count() > 0 or \
+               await page.locator('[aria-label="Create a post"]').count() > 0:
+                logged_in = True
+        except:
+            pass
 
-        # Type message
+        if logged_in:
+            print("✅ Successfully logged in!")
+        else:
+            print("❌ Login failed or cookies expired!")
+            await page.screenshot(path="01_login_failed.png")
+            await browser.close()
+            return
+
+        # === 2. Try to open Post Composer ===
+        print("🔄 Opening post composer...")
+        await page.screenshot(path="02_before_post_click.png")
+
+        post_opened = False
+        selectors = [
+            'div[role="button"]:has-text("What\'s on your mind?")',
+            'span:has-text("What\'s on your mind?")',
+            '[aria-label="Create a post"]',
+            'div.x1i10hfl.x1q0g3np',           # Common class
+            '[role="button"][tabindex="0"]'    # Fallback
+        ]
+
+        for selector in selectors:
+            try:
+                box = await page.wait_for_selector(selector, timeout=10000)
+                if box:
+                    await box.click()
+                    print(f"✅ Clicked using selector: {selector}")
+                    post_opened = True
+                    break
+            except:
+                continue
+
+        if not post_opened:
+            print("⚠️ Could not open post composer. Taking screenshot...")
+            await page.screenshot(path="02_post_open_failed.png")
+            await browser.close()
+            return
+
+        await asyncio.sleep(6)
+        await page.screenshot(path="03_composer_opened.png")
+
+        # === 3. Type Message ===
         try:
-            await page.wait_for_selector('div[role="textbox"], div[contenteditable="true"]', timeout=10000)
+            print("⌨️ Typing message...")
             editor = page.locator('div[role="textbox"], div[contenteditable="true"]').first
+            await editor.wait_for(timeout=10000)
             await editor.click()
             await editor.fill(message)
-            print(f"✅ Typed: {message}")
+            print(f"✅ Typed message: {message}")
             await asyncio.sleep(4)
-            await page.screenshot(path="03_message_typed.png")
+            await page.screenshot(path="04_message_typed.png")
         except Exception as e:
             print(f"⚠️ Failed to type message: {e}")
+            await page.screenshot(path="04_type_failed.png")
 
-        # Click Post button
+        # === 4. Click Post ===
         try:
             print("📤 Clicking Post button...")
-            await page.wait_for_selector('div[role="button"]:has-text("Post")', timeout=10000)
-            post_button = page.locator('div[role="button"]:has-text("Post")').last
-            await post_button.click()
+            await asyncio.sleep(3)
+            post_btn = page.locator('div[role="button"]:has-text("Post")').last
+            await post_btn.wait_for(timeout=10000)
+            await post_btn.click()
             print("✅ Clicked Post button")
-            await asyncio.sleep(12)   # Increased wait time as requested
-            await page.screenshot(path="04_after_post_click.png")
+            await asyncio.sleep(15)   # Long wait as requested
+            await page.screenshot(path="05_after_post_click.png")
         except Exception as e:
             print(f"⚠️ Failed to click Post: {e}")
+            await page.screenshot(path="05_post_click_failed.png")
 
-        # Extra wait to confirm post is published
-        print("⏳ Waiting 15 seconds to confirm post is shared...")
-        await asyncio.sleep(15)
-        await page.screenshot(path="05_final_result.png")
+        # === Final Confirmation ===
+        print("⏳ Waiting extra 12 seconds for post to be published...")
+        await asyncio.sleep(12)
+        await page.screenshot(path="06_final_result.png")
 
-        print("🎉 Post attempt finished. Check screenshots in artifacts.")
+        print("🎉 Process completed. Check all screenshots in artifacts.")
         await browser.close()
 
 
