@@ -3,6 +3,7 @@ from pathlib import Path
 from playwright.async_api import async_playwright
 
 COOKIES_TXT = "facebook_cookies.txt"
+SCREENSHOTS_DIR = Path("screenshots")
 
 
 def load_netscape_cookies(txt_file: str):
@@ -17,18 +18,20 @@ def load_netscape_cookies(txt_file: str):
             if not line or line.startswith('#'):
                 continue
 
-            parts = line.split('\t')  # Netscape format uses TABS, not spaces
+            parts = line.split('\t')
+            if len(parts) < 7:
+                # Try space-split as fallback
+                parts = line.split()
             if len(parts) < 7:
                 print(f"⚠️  Skipping malformed cookie line {line_num}: {line[:80]}")
                 continue
 
-            domain    = parts[0]
-            # parts[1] = flag (TRUE/FALSE) — whether all machines in domain can access
-            path      = parts[2]
-            secure    = parts[3].upper() == 'TRUE'
-            expires   = parts[4]
-            name      = parts[5]
-            value     = parts[6]
+            domain  = parts[0]
+            path    = parts[2]
+            secure  = parts[3].upper() == 'TRUE'
+            expires = parts[4]
+            name    = parts[5]
+            value   = parts[6]
 
             cookie = {
                 "name":     name,
@@ -36,7 +39,7 @@ def load_netscape_cookies(txt_file: str):
                 "domain":   domain if domain.startswith('.') else f".{domain}",
                 "path":     path,
                 "secure":   secure,
-                "httpOnly": False,  # Netscape format doesn't encode httpOnly
+                "httpOnly": False,
                 "sameSite": "None" if secure else "Lax",
             }
             if expires.lstrip('-').isdigit() and int(expires) > 0:
@@ -49,13 +52,57 @@ def load_netscape_cookies(txt_file: str):
 
 
 async def save_screenshot(page, name: str):
-    """Helper to always save a screenshot and log it."""
-    path = f"{name}.png"
+    """Save screenshot to screenshots/ subfolder AND root (belt+suspenders for CI)."""
+    SCREENSHOTS_DIR.mkdir(exist_ok=True)
+    paths = [
+        SCREENSHOTS_DIR / f"{name}.png",   # subfolder (artifact glob)
+        Path(f"{name}.png"),               # root fallback
+    ]
+    for p in paths:
+        try:
+            await page.screenshot(path=str(p), full_page=False)
+            print(f"📸 Screenshot saved: {p}")
+        except Exception as e:
+            print(f"⚠️  Could not save screenshot {p}: {e}")
+
+
+async def force_tap(page, locator):
+    """
+    Facebook mobile lite wraps elements in an overlay div that intercepts
+    pointer events — standard click() times out.  We use three strategies:
+    1. tap()        — touch event, bypasses most overlays on mobile contexts
+    2. click(force) — skip actionability checks entirely
+    3. JS click     — last resort, directly calls .click() in the DOM
+    """
+    box = await locator.bounding_box()
+    if box:
+        # Strategy 1: native touch tap at element centre
+        try:
+            cx = box["x"] + box["width"] / 2
+            cy = box["y"] + box["height"] / 2
+            await page.touchscreen.tap(cx, cy)
+            print(f"   ✅ Tapped at ({cx:.0f}, {cy:.0f})")
+            return True
+        except Exception as e:
+            print(f"   — tap() failed: {e}")
+
+    # Strategy 2: force click (skips visibility/intercept checks)
     try:
-        await page.screenshot(path=path, full_page=False)
-        print(f"📸 Screenshot saved: {path}")
+        await locator.click(force=True, timeout=5_000)
+        print("   ✅ force click succeeded")
+        return True
     except Exception as e:
-        print(f"⚠️  Could not save screenshot {path}: {e}")
+        print(f"   — force click failed: {e}")
+
+    # Strategy 3: JavaScript click
+    try:
+        await locator.evaluate("el => el.click()")
+        print("   ✅ JS .click() succeeded")
+        return True
+    except Exception as e:
+        print(f"   — JS click failed: {e}")
+
+    return False
 
 
 async def post_on_facebook(message: str = "Hello testing"):
@@ -98,7 +145,6 @@ async def post_on_facebook(message: str = "Hello testing"):
             return
 
         await context.add_cookies(cookies)
-
         page = await context.new_page()
 
         # ── STEP 1: Open Facebook ─────────────────────────────────────────────
@@ -123,14 +169,12 @@ async def post_on_facebook(message: str = "Hello testing"):
         current_url = page.url
         print(f"   Current URL: {current_url}")
 
-        # Redirect to login page means cookies are expired/invalid
         if "login" in current_url or "checkpoint" in current_url:
-            print("❌ Redirected to login — cookies are expired or invalid!")
+            print("❌ Redirected to login — cookies expired or invalid!")
             await save_screenshot(page, "02_login_redirect")
             await browser.close()
             return
 
-        # Look for any of the home-feed indicators
         login_indicators = [
             '[aria-label="Home"]',
             '[data-pagelet="FeedUnit_0"]',
@@ -149,10 +193,9 @@ async def post_on_facebook(message: str = "Hello testing"):
                 continue
 
         if not logged_in:
-            print("❌ Could not confirm login. Page HTML snippet:")
+            print("❌ Could not confirm login.")
             try:
-                snippet = await page.inner_text("body")
-                print(snippet[:500])
+                print(await page.inner_text("body"))
             except Exception:
                 pass
             await save_screenshot(page, "02_login_failed")
@@ -161,34 +204,52 @@ async def post_on_facebook(message: str = "Hello testing"):
 
         await save_screenshot(page, "02_logged_in")
 
-        # ── STEP 3: Click the post composer ───────────────────────────────────
+        # ── STEP 3: Open post composer ────────────────────────────────────────
+        # Facebook mobile lite: the "What's on your mind?" button is INSIDE an
+        # overlay container (data-mcomponent="MContainer") that intercepts all
+        # pointer events.  We must use touch/force strategies via force_tap().
         print("🔄 Opening post composer…")
 
         composer_selectors = [
-            'div[role="button"]:has-text("What\'s on your mind?")',
-            '[aria-label="Create a post"]',
+            # The actual button node (aria-label set on it)
+            'div[aria-label="What\'s on your mind?"]',
+            # The span text child — tap propagates up to the button
             'span:has-text("What\'s on your mind?")',
-            '[data-testid="status-attachment-mentions-input"]',
-            'form[method="POST"] div[role="button"]',
+            '[aria-label="Create a post"]',
+            # data-action-id is stable on FB mobile lite
+            'div[data-action-id]',
         ]
 
         post_opened = False
         for sel in composer_selectors:
             try:
                 el = page.locator(sel).first
-                if await el.count() > 0:
-                    await el.scroll_into_view_if_needed()
-                    await asyncio.sleep(1)
-                    await el.click()
+                count = await el.count()
+                if count == 0:
+                    print(f"   — Not found: {sel}")
+                    continue
+                print(f"   🎯 Found element via: {sel} — attempting force_tap…")
+                ok = await force_tap(page, el)
+                if ok:
                     print(f"   ✅ Opened composer via: {sel}")
                     post_opened = True
                     break
+                else:
+                    print(f"   — force_tap failed for: {sel}")
             except Exception as exc:
-                print(f"   — Selector failed ({sel}): {exc}")
+                print(f"   — Exception for ({sel}): {exc}")
                 continue
 
+        await save_screenshot(page, "03_after_composer_attempt")
+
         if not post_opened:
-            print("❌ Could not open post composer.")
+            print("❌ Could not open post composer — dumping page HTML for debug…")
+            try:
+                html = await page.content()
+                Path("page_debug.html").write_text(html, encoding="utf-8")
+                print("   📄 page_debug.html saved")
+            except Exception:
+                pass
             await save_screenshot(page, "03_composer_open_failed")
             await browser.close()
             return
@@ -202,26 +263,39 @@ async def post_on_facebook(message: str = "Hello testing"):
         text_selectors = [
             'div[role="textbox"][contenteditable="true"]',
             'div[contenteditable="true"]',
-            'div[aria-label="What\'s on your mind?"]',
+            'div[aria-label="What\'s on your mind?"][contenteditable="true"]',
             'div[data-lexical-editor="true"]',
+            # FB mobile lite uses a plain textarea sometimes
+            'textarea[name="xc_message"]',
+            'textarea',
         ]
 
         typed = False
         for sel in text_selectors:
             try:
                 editor = page.locator(sel).first
-                if await editor.count() > 0:
-                    await editor.wait_for(state="visible", timeout=10_000)
-                    await editor.click()
-                    await asyncio.sleep(1)
-                    # Use keyboard.type for contenteditable — fill() often fails
-                    await page.keyboard.type(message, delay=50)
-                    print(f"   ✅ Typed message via: {sel}")
-                    typed = True
-                    break
+                if await editor.count() == 0:
+                    continue
+                await editor.wait_for(state="visible", timeout=10_000)
+                # tap to focus (mobile context)
+                box = await editor.bounding_box()
+                if box:
+                    cx = box["x"] + box["width"] / 2
+                    cy = box["y"] + box["height"] / 2
+                    await page.touchscreen.tap(cx, cy)
+                else:
+                    await editor.click(force=True)
+                await asyncio.sleep(1)
+                # keyboard.type simulates real keystrokes on contenteditable
+                await page.keyboard.type(message, delay=60)
+                print(f"   ✅ Typed message via: {sel}")
+                typed = True
+                break
             except Exception as exc:
                 print(f"   — Typing selector failed ({sel}): {exc}")
                 continue
+
+        await save_screenshot(page, "04_after_type_attempt")
 
         if not typed:
             print("❌ Could not type message.")
@@ -234,13 +308,13 @@ async def post_on_facebook(message: str = "Hello testing"):
 
         # ── STEP 5: Click Post button ──────────────────────────────────────────
         print("📤 Clicking Post button…")
-
-        # Wait a moment so the Post button becomes active (it's disabled until text exists)
         await asyncio.sleep(2)
 
         post_btn_selectors = [
             'div[aria-label="Post"][role="button"]',
-            'div[role="button"]:has-text("Post"):not([aria-disabled="true"])',
+            'button[name="share"]',
+            'input[type="submit"][value="Post"]',
+            'div[role="button"]:has-text("Post")',
             'span:has-text("Post")',
         ]
 
@@ -248,20 +322,23 @@ async def post_on_facebook(message: str = "Hello testing"):
         for sel in post_btn_selectors:
             try:
                 btn = page.locator(sel).last
-                if await btn.count() > 0:
-                    await btn.wait_for(state="visible", timeout=10_000)
-                    # Confirm it's not disabled
-                    disabled = await btn.get_attribute("aria-disabled")
-                    if disabled == "true":
-                        print(f"   ⚠️  Button is disabled: {sel}")
-                        continue
-                    await btn.click()
+                if await btn.count() == 0:
+                    continue
+                await btn.wait_for(state="visible", timeout=8_000)
+                disabled = await btn.get_attribute("aria-disabled")
+                if disabled == "true":
+                    print(f"   ⚠️  Button disabled: {sel}")
+                    continue
+                ok = await force_tap(page, btn)
+                if ok:
                     print(f"   ✅ Clicked Post via: {sel}")
                     posted = True
                     break
             except Exception as exc:
-                print(f"   — Post button selector failed ({sel}): {exc}")
+                print(f"   — Post button failed ({sel}): {exc}")
                 continue
+
+        await save_screenshot(page, "05_after_post_attempt")
 
         if not posted:
             print("❌ Could not click Post button.")
@@ -278,15 +355,11 @@ async def post_on_facebook(message: str = "Hello testing"):
         await asyncio.sleep(10)
         await save_screenshot(page, "06_final_result")
 
-        # Quick check — did composer close? (good sign)
-        composer_still_open = False
-        for sel in text_selectors:
-            if await page.locator(sel).count() > 0:
-                composer_still_open = True
-                break
-
+        composer_still_open = any([
+            await page.locator(s).count() > 0 for s in text_selectors
+        ])
         if composer_still_open:
-            print("⚠️  Composer may still be open — post might not have been published.")
+            print("⚠️  Composer may still be open — post might not have published.")
         else:
             print("🎉 Post published successfully!")
 
