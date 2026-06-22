@@ -198,8 +198,6 @@ async def upload_reel(caption: str, video_path: str):
         print(f"   URL: {page.url}")
 
         # ── STEP 4: Attach video file ─────────────────────────────────────────
-        # Strategy A: direct hidden file input (desktop reels page has one)
-        # Strategy B: click "Select video from computer" button → file chooser
         print("\n📁 Attaching video…")
 
         uploaded = False
@@ -226,7 +224,6 @@ async def upload_reel(caption: str, video_path: str):
                 'span:has-text("Select video")',
                 'span:has-text("Select Video")',
                 '[aria-label="Select video"]',
-                # Desktop reels create page button
                 'div[aria-label="Add to reel"]',
                 'div:has-text("Select video from computer")',
             ]
@@ -263,17 +260,85 @@ async def upload_reel(caption: str, video_path: str):
         # ── STEP 6: Enter caption ─────────────────────────────────────────────
         print("\n✍️  Entering caption…")
 
+        # Tightened selector list — no bare 'textarea' / 'div[contenteditable]'
+        # at the top, since those can match hidden/duplicate nodes on FB's DOM
+        # and silently grab the wrong element.
         caption_selectors = [
             'div[aria-label="Describe your reel"][contenteditable="true"]',
             'div[aria-label*="description" i][contenteditable="true"]',
             'div[aria-label*="caption" i][contenteditable="true"]',
-            'div[data-lexical-editor="true"]',
+            'div[data-lexical-editor="true"][contenteditable="true"]',
             'div[role="textbox"][contenteditable="true"]',
             'textarea[placeholder*="description" i]',
             'textarea[placeholder*="caption" i]',
-            'textarea',
-            'div[contenteditable="true"]',
         ]
+
+        async def verify_caption_present(loc) -> bool:
+            """Check the field's actual text content / value after typing."""
+            try:
+                txt = await loc.evaluate(
+                    "el => (el.innerText || el.textContent || el.value || '').trim()"
+                )
+                return len(txt) > 0
+            except Exception:
+                return False
+
+        async def type_via_keyboard(field) -> bool:
+            try:
+                await field.scroll_into_view_if_needed(timeout=5_000)
+                await field.click(timeout=5_000)
+                await asyncio.sleep(0.4)
+                # Click again to ensure focus lands on the innermost editable
+                # node rather than a wrapping role="button" container.
+                await field.click(timeout=5_000)
+                await asyncio.sleep(0.3)
+                await page.keyboard.type(caption, delay=40)
+                await asyncio.sleep(0.5)
+                return await verify_caption_present(field)
+            except Exception as e:
+                print(f"      keyboard.type attempt failed: {e}")
+                return False
+
+        async def type_via_js_injection(field) -> bool:
+            """
+            Fallback for Lexical/Draft.js editors: focus, select all content,
+            then try execCommand('insertText', ...) first (most Lexical builds
+            honor this), and if that leaves the field empty, fall back to
+            directly setting textContent and dispatching beforeinput/input/
+            change events so React/Lexical state updates pick it up.
+            """
+            try:
+                await field.click(timeout=5_000)
+                await asyncio.sleep(0.3)
+                await field.evaluate(
+                    """(el, text) => {
+                        el.focus();
+                        const sel = window.getSelection();
+                        sel.removeAllRanges();
+                        const range = document.createRange();
+                        range.selectNodeContents(el);
+                        sel.addRange(range);
+
+                        document.execCommand('insertText', false, text);
+
+                        if (!(el.innerText || el.textContent || '').trim()) {
+                            el.textContent = text;
+                            el.dispatchEvent(new InputEvent('beforeinput', {
+                                bubbles: true, cancelable: true, data: text
+                            }));
+                            el.dispatchEvent(new InputEvent('input', {
+                                bubbles: true, cancelable: true, data: text
+                            }));
+                            el.dispatchEvent(new Event('change', { bubbles: true }));
+                        }
+                    }""",
+                    caption,
+                )
+                await asyncio.sleep(0.5)
+                return await verify_caption_present(field)
+            except Exception as e:
+                print(f"      JS injection attempt failed: {e}")
+                return False
 
         caption_typed = False
         for sel in caption_selectors:
@@ -282,12 +347,19 @@ async def upload_reel(caption: str, video_path: str):
                 if await field.count() == 0:
                     continue
                 await field.wait_for(state="visible", timeout=8_000)
-                await field.click()
-                await asyncio.sleep(0.5)
-                await page.keyboard.type(caption, delay=50)
-                print(f"   ✅ Caption typed via: {sel}")
-                caption_typed = True
-                break
+
+                print(f"   🎯 Trying: {sel}")
+                ok = await type_via_keyboard(field)
+                if not ok:
+                    print("      ↳ keyboard typing left field empty, trying JS injection…")
+                    ok = await type_via_js_injection(field)
+
+                if ok:
+                    print(f"   ✅ Caption confirmed present via: {sel}")
+                    caption_typed = True
+                    break
+                else:
+                    print(f"      ↳ field still empty after both attempts, trying next selector")
             except Exception as e:
                 print(f"   — {sel}: {e}")
 
@@ -302,7 +374,6 @@ async def upload_reel(caption: str, video_path: str):
         # ── STEP 7: Click Next (if present) then Publish/Share ────────────────
         print("\n📤 Looking for Next / Publish / Share…")
 
-        # Handle multi-step flow: click Next until we reach Publish
         for step_name, selectors in [
             ("Next", [
                 'div[aria-label="Next"][role="button"]',
