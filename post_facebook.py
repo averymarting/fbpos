@@ -2,110 +2,104 @@ import asyncio
 from pathlib import Path
 from playwright.async_api import async_playwright
 
-COOKIES_TXT = "facebook_cookies.txt"
+COOKIES_TXT  = "facebook_cookies.txt"
+CAPTIONS_TXT = "captions.txt"
+VIDEO_FILE   = "testing.mp4"
 SCREENSHOTS_DIR = Path("screenshots")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
 def load_netscape_cookies(txt_file: str):
-    """
-    Parse Netscape/Mozilla cookie format.
-    Columns: domain | flag | path | secure | expiration | name | value
-    """
     cookies = []
     with open(txt_file, 'r', encoding='utf-8') as f:
         for line_num, line in enumerate(f, 1):
             line = line.strip()
             if not line or line.startswith('#'):
                 continue
-
             parts = line.split('\t')
             if len(parts) < 7:
-                # Try space-split as fallback
                 parts = line.split()
             if len(parts) < 7:
                 print(f"⚠️  Skipping malformed cookie line {line_num}: {line[:80]}")
                 continue
-
-            domain  = parts[0]
-            path    = parts[2]
-            secure  = parts[3].upper() == 'TRUE'
-            expires = parts[4]
-            name    = parts[5]
-            value   = parts[6]
-
+            domain, _, path, secure_s, expires, name, value = parts[:7]
             cookie = {
                 "name":     name,
                 "value":    value,
                 "domain":   domain if domain.startswith('.') else f".{domain}",
                 "path":     path,
-                "secure":   secure,
+                "secure":   secure_s.upper() == 'TRUE',
                 "httpOnly": False,
-                "sameSite": "None" if secure else "Lax",
+                "sameSite": "None" if secure_s.upper() == 'TRUE' else "Lax",
             }
             if expires.lstrip('-').isdigit() and int(expires) > 0:
                 cookie["expires"] = int(expires)
-
             cookies.append(cookie)
-
-    print(f"✅ Loaded {len(cookies)} cookies from {txt_file}")
+    print(f"✅ Loaded {len(cookies)} cookies")
     return cookies
 
 
 async def save_screenshot(page, name: str):
-    """Save screenshot to screenshots/ subfolder AND root (belt+suspenders for CI)."""
     SCREENSHOTS_DIR.mkdir(exist_ok=True)
-    paths = [
-        SCREENSHOTS_DIR / f"{name}.png",   # subfolder (artifact glob)
-        Path(f"{name}.png"),               # root fallback
-    ]
-    for p in paths:
+    for p in [SCREENSHOTS_DIR / f"{name}.png", Path(f"{name}.png")]:
         try:
             await page.screenshot(path=str(p), full_page=False)
-            print(f"📸 Screenshot saved: {p}")
+            print(f"📸 {p}")
         except Exception as e:
-            print(f"⚠️  Could not save screenshot {p}: {e}")
+            print(f"⚠️  Screenshot failed {p}: {e}")
 
 
 async def force_tap(page, locator):
-    """
-    Facebook mobile lite wraps elements in an overlay div that intercepts
-    pointer events — standard click() times out.  We use three strategies:
-    1. tap()        — touch event, bypasses most overlays on mobile contexts
-    2. click(force) — skip actionability checks entirely
-    3. JS click     — last resort, directly calls .click() in the DOM
-    """
+    """Touch-tap → force-click → JS-click fallback chain."""
     box = await locator.bounding_box()
     if box:
-        # Strategy 1: native touch tap at element centre
         try:
             cx = box["x"] + box["width"] / 2
             cy = box["y"] + box["height"] / 2
             await page.touchscreen.tap(cx, cy)
-            print(f"   ✅ Tapped at ({cx:.0f}, {cy:.0f})")
+            print(f"   ✅ tap at ({cx:.0f},{cy:.0f})")
             return True
         except Exception as e:
-            print(f"   — tap() failed: {e}")
-
-    # Strategy 2: force click (skips visibility/intercept checks)
+            print(f"   — tap failed: {e}")
     try:
         await locator.click(force=True, timeout=5_000)
-        print("   ✅ force click succeeded")
+        print("   ✅ force-click")
         return True
     except Exception as e:
-        print(f"   — force click failed: {e}")
-
-    # Strategy 3: JavaScript click
+        print(f"   — force-click failed: {e}")
     try:
         await locator.evaluate("el => el.click()")
-        print("   ✅ JS .click() succeeded")
+        print("   ✅ JS click")
         return True
     except Exception as e:
         print(f"   — JS click failed: {e}")
-
     return False
 
 
-async def post_on_facebook(message: str = "Hello testing"):
+async def dump_html(page, filename="page_debug.html"):
+    try:
+        html = await page.content()
+        Path(filename).write_text(html, encoding="utf-8")
+        print(f"   📄 {filename} saved")
+    except Exception as e:
+        print(f"   ⚠️  Could not dump HTML: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def upload_reel(caption: str, video_path: str):
+    # Validate files exist before even opening the browser
+    if not Path(video_path).exists():
+        print(f"❌ Video file not found: {video_path}")
+        return
+    print(f"🎬 Video   : {video_path}  ({Path(video_path).stat().st_size // 1024} KB)")
+    print(f"📝 Caption : {caption[:80]}")
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
@@ -130,196 +124,238 @@ async def post_on_facebook(message: str = "Hello testing"):
             has_touch=True,
             locale="en-US",
             timezone_id="Asia/Karachi",
+            accept_downloads=True,
         )
 
-        # ── Load cookies ──────────────────────────────────────────────────────
+        # ── Cookies ───────────────────────────────────────────────────────────
         if not Path(COOKIES_TXT).exists():
-            print(f"❌ Cookies file '{COOKIES_TXT}' not found!")
+            print(f"❌ {COOKIES_TXT} not found")
             await browser.close()
             return
-
         cookies = load_netscape_cookies(COOKIES_TXT)
         if not cookies:
-            print("❌ No cookies were loaded — check the file format.")
+            print("❌ No cookies loaded")
             await browser.close()
             return
-
         await context.add_cookies(cookies)
+
         page = await context.new_page()
 
-        # ── STEP 1: Open Facebook ─────────────────────────────────────────────
-        print("🌐 Opening Facebook…")
+        # ── STEP 1: Load Facebook ─────────────────────────────────────────────
+        print("\n🌐 Opening Facebook…")
         try:
-            await page.goto(
-                "https://www.facebook.com/",
-                wait_until="domcontentloaded",
-                timeout=60_000,
-            )
+            await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=60_000)
         except Exception as e:
-            print(f"❌ Failed to load Facebook: {e}")
+            print(f"❌ Load failed: {e}")
             await save_screenshot(page, "00_load_failed")
             await browser.close()
             return
-
         await asyncio.sleep(8)
         await save_screenshot(page, "01_after_load")
 
-        # ── STEP 2: Verify login ───────────────────────────────────────────────
-        print("🔍 Checking login status…")
-        current_url = page.url
-        print(f"   Current URL: {current_url}")
-
-        if "login" in current_url or "checkpoint" in current_url:
-            print("❌ Redirected to login — cookies expired or invalid!")
-            await save_screenshot(page, "02_login_redirect")
-            await browser.close()
-            return
-
-        login_indicators = [
-            '[aria-label="Home"]',
-            '[data-pagelet="FeedUnit_0"]',
-            'div[role="feed"]',
-            '[aria-label="Create a post"]',
-            'span:has-text("What\'s on your mind?")',
-        ]
-        logged_in = False
-        for indicator in login_indicators:
-            try:
-                if await page.locator(indicator).count() > 0:
-                    logged_in = True
-                    print(f"   ✅ Login confirmed via: {indicator}")
-                    break
-            except Exception:
-                continue
-
-        if not logged_in:
-            print("❌ Could not confirm login.")
-            try:
-                print(await page.inner_text("body"))
-            except Exception:
-                pass
+        # ── STEP 2: Check login ───────────────────────────────────────────────
+        print("🔍 Checking login…")
+        if "login" in page.url or "checkpoint" in page.url:
+            print("❌ Not logged in — cookies expired")
             await save_screenshot(page, "02_login_failed")
             await browser.close()
             return
 
+        login_ok = False
+        for sel in ['span:has-text("What\'s on your mind?")', '[aria-label="Home"]',
+                    'div[role="feed"]', '[aria-label="Create a post"]']:
+            if await page.locator(sel).count() > 0:
+                login_ok = True
+                print(f"   ✅ Logged in (via {sel})")
+                break
+        if not login_ok:
+            print("❌ Login check failed")
+            await dump_html(page, "02_login_failed.html")
+            await save_screenshot(page, "02_login_failed")
+            await browser.close()
+            return
         await save_screenshot(page, "02_logged_in")
 
-        # ── STEP 3: Open post composer ────────────────────────────────────────
-        # Facebook mobile lite: the "What's on your mind?" button is INSIDE an
-        # overlay container (data-mcomponent="MContainer") that intercepts all
-        # pointer events.  We must use touch/force strategies via force_tap().
-        print("🔄 Opening post composer…")
+        # ── STEP 3: Navigate to Reels creation ───────────────────────────────
+        # Facebook's Reels upload lives at /reels/create — works on mobile UA
+        print("\n🎬 Navigating to Reels creation page…")
+        try:
+            await page.goto("https://www.facebook.com/reels/create", wait_until="domcontentloaded", timeout=60_000)
+        except Exception as e:
+            print(f"❌ Could not open reels/create: {e}")
+            await save_screenshot(page, "03_reels_nav_failed")
+            await browser.close()
+            return
+        await asyncio.sleep(6)
+        await save_screenshot(page, "03_reels_page")
 
-        composer_selectors = [
-            # The actual button node (aria-label set on it)
-            'div[aria-label="What\'s on your mind?"]',
-            # The span text child — tap propagates up to the button
-            'span:has-text("What\'s on your mind?")',
-            '[aria-label="Create a post"]',
-            # data-action-id is stable on FB mobile lite
-            'div[data-action-id]',
+        # If redirected away (e.g. desktop reels page) try the mobile composer route
+        if "reels/create" not in page.url:
+            print(f"   ⚠️  Redirected to: {page.url} — trying mobile composer")
+            await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=60_000)
+            await asyncio.sleep(5)
+
+            # Click the Reels nav icon (bottom bar on mobile)
+            reel_nav_selectors = [
+                'a[href*="/reels"]',
+                '[aria-label="Reels"]',
+                'span:has-text("Reels")',
+            ]
+            for sel in reel_nav_selectors:
+                el = page.locator(sel).first
+                if await el.count() > 0:
+                    await force_tap(page, el)
+                    await asyncio.sleep(5)
+                    await save_screenshot(page, "03b_after_reels_nav")
+                    break
+
+        await save_screenshot(page, "03_reels_loaded")
+
+        # ── STEP 4: Find & click the file upload input ────────────────────────
+        # Reels create page has a hidden <input type="file"> — we set_input_files on it
+        print("\n📁 Looking for file upload input…")
+        await asyncio.sleep(3)
+
+        upload_selectors = [
+            'input[type="file"][accept*="video"]',
+            'input[type="file"]',
         ]
 
-        post_opened = False
-        for sel in composer_selectors:
+        uploaded = False
+        for sel in upload_selectors:
             try:
+                inp = page.locator(sel).first
+                if await inp.count() > 0:
+                    print(f"   🎯 Found upload input: {sel}")
+                    await inp.set_input_files(video_path)
+                    print(f"   ✅ File set: {video_path}")
+                    uploaded = True
+                    break
+            except Exception as e:
+                print(f"   — {sel} failed: {e}")
+
+        if not uploaded:
+            # Try clicking any "Select video" / "Add video" button first to reveal the input
+            print("   🔄 No direct input found — trying to click upload button…")
+            upload_btn_selectors = [
+                'div[role="button"]:has-text("Select video")',
+                'div[role="button"]:has-text("Add video")',
+                'div[role="button"]:has-text("Upload")',
+                'span:has-text("Select video")',
+                'span:has-text("Add video")',
+                '[aria-label="Select video"]',
+            ]
+            for sel in upload_btn_selectors:
                 el = page.locator(sel).first
-                count = await el.count()
-                if count == 0:
-                    print(f"   — Not found: {sel}")
-                    continue
-                print(f"   🎯 Found element via: {sel} — attempting force_tap…")
-                ok = await force_tap(page, el)
-                if ok:
-                    print(f"   ✅ Opened composer via: {sel}")
-                    post_opened = True
+                if await el.count() > 0:
+                    print(f"   🎯 Found upload button: {sel}")
+                    # Listen for file chooser before clicking
+                    async with page.expect_file_chooser(timeout=10_000) as fc_info:
+                        await force_tap(page, el)
+                    fc = await fc_info.value
+                    await fc.set_files(video_path)
+                    print(f"   ✅ File chosen via file chooser")
+                    uploaded = True
                     break
                 else:
-                    print(f"   — force_tap failed for: {sel}")
-            except Exception as exc:
-                print(f"   — Exception for ({sel}): {exc}")
-                continue
+                    print(f"   — Not found: {sel}")
 
-        await save_screenshot(page, "03_after_composer_attempt")
+        await save_screenshot(page, "04_after_upload_attempt")
 
-        if not post_opened:
-            print("❌ Could not open post composer — dumping page HTML for debug…")
-            try:
-                html = await page.content()
-                Path("page_debug.html").write_text(html, encoding="utf-8")
-                print("   📄 page_debug.html saved")
-            except Exception:
-                pass
-            await save_screenshot(page, "03_composer_open_failed")
+        if not uploaded:
+            print("❌ Could not attach video file")
+            await dump_html(page, "04_upload_failed.html")
+            await save_screenshot(page, "04_upload_failed")
             await browser.close()
             return
 
-        await asyncio.sleep(6)
-        await save_screenshot(page, "03_composer_opened")
+        # ── STEP 5: Wait for video to process / upload ────────────────────────
+        print("\n⏳ Waiting for video to upload/process (30 s)…")
+        await asyncio.sleep(30)
+        await save_screenshot(page, "05_after_video_upload")
 
-        # ── STEP 4: Type the message ───────────────────────────────────────────
-        print("⌨️  Typing message…")
+        # ── STEP 6: Enter caption / description ──────────────────────────────
+        print("\n✍️  Entering caption…")
 
-        text_selectors = [
+        caption_selectors = [
+            # Standard Reels caption field
+            'div[aria-label="Describe your reel"][contenteditable="true"]',
+            'div[aria-label*="caption"][contenteditable="true"]',
+            'div[aria-label*="Caption"][contenteditable="true"]',
+            'div[aria-label*="description"][contenteditable="true"]',
+            'div[aria-label*="Description"][contenteditable="true"]',
+            # Generic contenteditable fallback
             'div[role="textbox"][contenteditable="true"]',
             'div[contenteditable="true"]',
-            'div[aria-label="What\'s on your mind?"][contenteditable="true"]',
-            'div[data-lexical-editor="true"]',
-            # FB mobile lite uses a plain textarea sometimes
-            'textarea[name="xc_message"]',
+            'textarea[aria-label*="caption" i]',
+            'textarea[aria-label*="description" i]',
+            'textarea[placeholder*="caption" i]',
+            'textarea[placeholder*="description" i]',
             'textarea',
         ]
 
-        typed = False
-        for sel in text_selectors:
+        caption_typed = False
+        for sel in caption_selectors:
             try:
-                editor = page.locator(sel).first
-                if await editor.count() == 0:
+                field = page.locator(sel).first
+                if await field.count() == 0:
                     continue
-                await editor.wait_for(state="visible", timeout=10_000)
-                # tap to focus (mobile context)
-                box = await editor.bounding_box()
+                await field.wait_for(state="visible", timeout=8_000)
+                box = await field.bounding_box()
                 if box:
-                    cx = box["x"] + box["width"] / 2
-                    cy = box["y"] + box["height"] / 2
-                    await page.touchscreen.tap(cx, cy)
+                    await page.touchscreen.tap(box["x"] + box["width"]/2, box["y"] + box["height"]/2)
                 else:
-                    await editor.click(force=True)
+                    await field.click(force=True)
                 await asyncio.sleep(1)
-                # keyboard.type simulates real keystrokes on contenteditable
-                await page.keyboard.type(message, delay=60)
-                print(f"   ✅ Typed message via: {sel}")
-                typed = True
+                await page.keyboard.type(caption, delay=50)
+                print(f"   ✅ Caption typed via: {sel}")
+                caption_typed = True
                 break
-            except Exception as exc:
-                print(f"   — Typing selector failed ({sel}): {exc}")
-                continue
+            except Exception as e:
+                print(f"   — {sel} failed: {e}")
 
-        await save_screenshot(page, "04_after_type_attempt")
+        await save_screenshot(page, "06_after_caption_attempt")
 
-        if not typed:
-            print("❌ Could not type message.")
-            await save_screenshot(page, "04_type_failed")
-            await browser.close()
-            return
+        if not caption_typed:
+            print("⚠️  Could not type caption — will still try to publish")
+            await dump_html(page, "06_caption_failed.html")
+        else:
+            await asyncio.sleep(2)
+            await save_screenshot(page, "06_caption_typed")
 
-        await asyncio.sleep(3)
-        await save_screenshot(page, "04_message_typed")
+        # ── STEP 7: Click Publish / Share / Next ─────────────────────────────
+        # Reels flow sometimes has a Next button before the final Publish
+        print("\n📤 Looking for Next / Publish / Share button…")
 
-        # ── STEP 5: Click Post button ──────────────────────────────────────────
-        print("📤 Clicking Post button…")
-        await asyncio.sleep(2)
+        # First handle any "Next" step
+        next_selectors = [
+            'div[role="button"]:has-text("Next")',
+            'span:has-text("Next")',
+            'button:has-text("Next")',
+        ]
+        for sel in next_selectors:
+            btn = page.locator(sel).last
+            if await btn.count() > 0:
+                print(f"   🎯 Found Next button: {sel}")
+                await force_tap(page, btn)
+                await asyncio.sleep(5)
+                await save_screenshot(page, "07_after_next")
+                break
 
-        post_btn_selectors = [
-            'div[aria-label="Post"][role="button"]',
-            'button[name="share"]',
-            'input[type="submit"][value="Post"]',
-            'div[role="button"]:has-text("Post")',
-            'span:has-text("Post")',
+        # Now find the final Publish/Share button
+        publish_selectors = [
+            'div[role="button"]:has-text("Publish")',
+            'div[role="button"]:has-text("Share")',
+            'button:has-text("Publish")',
+            'button:has-text("Share")',
+            'input[type="submit"][value="Publish"]',
+            'input[type="submit"][value="Share"]',
+            'span:has-text("Publish")',
+            'span:has-text("Share")',
         ]
 
-        posted = False
-        for sel in post_btn_selectors:
+        published = False
+        for sel in publish_selectors:
             try:
                 btn = page.locator(sel).last
                 if await btn.count() == 0:
@@ -329,42 +365,60 @@ async def post_on_facebook(message: str = "Hello testing"):
                 if disabled == "true":
                     print(f"   ⚠️  Button disabled: {sel}")
                     continue
+                print(f"   🎯 Found publish button: {sel}")
                 ok = await force_tap(page, btn)
                 if ok:
-                    print(f"   ✅ Clicked Post via: {sel}")
-                    posted = True
+                    print(f"   ✅ Publish clicked via: {sel}")
+                    published = True
                     break
-            except Exception as exc:
-                print(f"   — Post button failed ({sel}): {exc}")
-                continue
+            except Exception as e:
+                print(f"   — {sel} failed: {e}")
 
-        await save_screenshot(page, "05_after_post_attempt")
+        await save_screenshot(page, "07_after_publish_attempt")
 
-        if not posted:
-            print("❌ Could not click Post button.")
-            await save_screenshot(page, "05_post_btn_failed")
+        if not published:
+            print("❌ Could not click Publish/Share button")
+            await dump_html(page, "07_publish_failed.html")
+            await save_screenshot(page, "07_publish_failed")
             await browser.close()
             return
 
-        # ── STEP 6: Wait & confirm ─────────────────────────────────────────────
-        print("⏳ Waiting for post to publish (15 s)…")
-        await asyncio.sleep(15)
-        await save_screenshot(page, "05_after_post_click")
+        # ── STEP 8: Wait for confirmation ─────────────────────────────────────
+        print("\n⏳ Waiting for reel to publish (20 s)…")
+        await asyncio.sleep(20)
+        await save_screenshot(page, "08_after_publish_wait")
 
         print("⏳ Extra 10 s safety wait…")
         await asyncio.sleep(10)
-        await save_screenshot(page, "06_final_result")
+        await save_screenshot(page, "09_final_result")
 
-        composer_still_open = any([
-            await page.locator(s).count() > 0 for s in text_selectors
-        ])
-        if composer_still_open:
-            print("⚠️  Composer may still be open — post might not have published.")
+        # Success indicators
+        success_selectors = [
+            'span:has-text("Your reel is now shared")',
+            'span:has-text("Reel posted")',
+            'span:has-text("Published")',
+            'div:has-text("Your reel")',
+        ]
+        for sel in success_selectors:
+            if await page.locator(sel).count() > 0:
+                print(f"🎉 Reel published! (confirmed via: {sel})")
+                break
         else:
-            print("🎉 Post published successfully!")
+            print("🎉 Process completed — check screenshots for confirmation.")
 
         await browser.close()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
-    asyncio.run(post_on_facebook("Hello testing"))
+    # Read caption from file
+    caption_path = Path(CAPTIONS_TXT)
+    if caption_path.exists():
+        caption = caption_path.read_text(encoding="utf-8").strip()
+        print(f"📝 Caption loaded from {CAPTIONS_TXT}")
+    else:
+        caption = "Check out my latest reel! #reels"
+        print(f"⚠️  {CAPTIONS_TXT} not found — using default caption")
+
+    asyncio.run(upload_reel(caption=caption, video_path=VIDEO_FILE))
