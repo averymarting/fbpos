@@ -61,6 +61,22 @@ async def dump_html(page, filename="page_debug.html"):
         print(f"   ⚠️  HTML dump failed: {e}")
 
 
+async def dump_all_frames(page, base_name="page_debug"):
+    """
+    page.content() only returns the main document. If Facebook renders the
+    composer inside a frame, the main-document dump will look empty/wrong
+    for our purposes. This saves one file per frame so we can tell.
+    """
+    for i, fr in enumerate(page.frames):
+        try:
+            html = await fr.content()
+            fname = f"{base_name}_frame{i}.html"
+            Path(fname).write_text(html, encoding="utf-8")
+            print(f"   📄 {fname} saved (url={fr.url[:80]!r}, {len(html)} chars)")
+        except Exception as e:
+            print(f"   ⚠️  Frame {i} dump failed: {e}")
+
+
 async def force_tap(page, locator):
     """Touch-tap → force-click → JS-click fallback chain."""
     box = await locator.bounding_box()
@@ -253,12 +269,62 @@ async def upload_reel(caption: str, video_path: str):
             return
 
         # ── STEP 5: Wait for video processing ────────────────────────────────
-        print("\n⏳ Waiting for video to process (40 s)…")
-        await asyncio.sleep(40)
+        # The countdown-leader animation (numbers in a circular reticle) is
+        # Facebook's own placeholder while the upload is still transcoding —
+        # it is NOT your video's actual content. We poll for signs that
+        # processing has actually finished instead of guessing a fixed delay.
+        print("\n⏳ Waiting for video to process…")
+
+        max_wait = 90
+        poll_every = 3
+        elapsed = 0
+        processing_done = False
+
+        while elapsed < max_wait:
+            await asyncio.sleep(poll_every)
+            elapsed += poll_every
+
+            # Heuristic 1: "Describe your reel" field exists and is attached
+            desc_field = page.locator('div[aria-label="Describe your reel"]').first
+            has_desc = await desc_field.count() > 0
+
+            # Heuristic 2: a Next button exists and is NOT aria-disabled
+            next_btn = page.locator('div[aria-label="Next"][role="button"]').first
+            next_present = await next_btn.count() > 0
+            next_enabled = False
+            if next_present:
+                disabled_attr = await next_btn.get_attribute("aria-disabled")
+                next_enabled = disabled_attr != "true"
+
+            print(f"   …{elapsed}s — caption field present: {has_desc}, "
+                  f"Next present: {next_present}, Next enabled: {next_enabled}")
+
+            if has_desc and next_present and next_enabled:
+                processing_done = True
+                break
+
+        if processing_done:
+            print(f"   ✅ Composer appears ready after {elapsed}s")
+        else:
+            print(f"   ⚠️  Composer not confirmed ready after {max_wait}s — proceeding anyway")
+
         await save_screenshot(page, "05_after_processing")
+        await dump_html(page, "05_page_state.html")
 
         # ── STEP 6: Enter caption ─────────────────────────────────────────────
         print("\n✍️  Entering caption…")
+
+        # Diagnostic: dump state across ALL frames right before we try typing,
+        # so if the composer turns out to be frame-scoped we can see it here
+        # instead of guessing from a top-frame-only dump after the fact.
+        print(f"   🔎 Frame count on page: {len(page.frames)}")
+        for i, fr in enumerate(page.frames):
+            try:
+                fr_url = fr.url
+                fr_has_desc = await fr.locator('div[aria-label="Describe your reel"]').count()
+                print(f"      frame[{i}] url={fr_url[:80]!r} has_desc_field={fr_has_desc}")
+            except Exception as e:
+                print(f"      frame[{i}] inspect failed: {e}")
 
         # Tightened selector list — no bare 'textarea' / 'div[contenteditable]'
         # at the top, since those can match hidden/duplicate nodes on FB's DOM
@@ -341,31 +407,39 @@ async def upload_reel(caption: str, video_path: str):
                 return False
 
         caption_typed = False
-        for sel in caption_selectors:
-            try:
-                field = page.locator(sel).first
-                if await field.count() == 0:
-                    continue
-                await field.wait_for(state="visible", timeout=8_000)
+        search_contexts = [("main", page)] + [
+            (f"frame[{i}]", fr) for i, fr in enumerate(page.frames) if fr != page.main_frame
+        ]
 
-                print(f"   🎯 Trying: {sel}")
-                ok = await type_via_keyboard(field)
-                if not ok:
-                    print("      ↳ keyboard typing left field empty, trying JS injection…")
-                    ok = await type_via_js_injection(field)
+        for ctx_name, ctx in search_contexts:
+            if caption_typed:
+                break
+            for sel in caption_selectors:
+                try:
+                    field = ctx.locator(sel).first
+                    if await field.count() == 0:
+                        continue
+                    await field.wait_for(state="visible", timeout=8_000)
 
-                if ok:
-                    print(f"   ✅ Caption confirmed present via: {sel}")
-                    caption_typed = True
-                    break
-                else:
-                    print(f"      ↳ field still empty after both attempts, trying next selector")
-            except Exception as e:
-                print(f"   — {sel}: {e}")
+                    print(f"   🎯 Trying: {sel} (in {ctx_name})")
+                    ok = await type_via_keyboard(field)
+                    if not ok:
+                        print("      ↳ keyboard typing left field empty, trying JS injection…")
+                        ok = await type_via_js_injection(field)
+
+                    if ok:
+                        print(f"   ✅ Caption confirmed present via: {sel} (in {ctx_name})")
+                        caption_typed = True
+                        break
+                    else:
+                        print(f"      ↳ field still empty after both attempts, trying next selector")
+                except Exception as e:
+                    print(f"   — {sel} (in {ctx_name}): {e}")
 
         if not caption_typed:
             print("⚠️  Could not type caption — continuing to publish anyway")
             await dump_html(page, "06_caption_failed.html")
+            await dump_all_frames(page, "06_caption_failed")
         else:
             await asyncio.sleep(2)
 
