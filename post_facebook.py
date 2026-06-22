@@ -52,7 +52,7 @@ async def save_screenshot(page, name: str):
             print(f"⚠️  Screenshot failed {p}: {e}")
 
 
-async def dump_html(page, filename="page_debug.html"):
+async def dump_html(page, filename: str):
     try:
         html = await page.content()
         Path(filename).write_text(html, encoding="utf-8")
@@ -88,6 +88,42 @@ async def force_tap(page, locator):
     return False
 
 
+async def click_next(page) -> bool:
+    """
+    Click the Next button using exact aria-label="Next".
+    Waits up to 10 s for it to appear, then force-taps it.
+    Returns True if clicked.
+    """
+    sel = '[aria-label="Next"][role="button"]'
+    try:
+        btn = page.locator(sel).first
+        await btn.wait_for(state="visible", timeout=10_000)
+        disabled = await btn.get_attribute("aria-disabled")
+        if disabled == "true":
+            print("   ⚠️  Next button is disabled")
+            return False
+        ok = await force_tap(page, btn)
+        return ok
+    except Exception as e:
+        print(f"   — Next button not found: {e}")
+        return False
+
+
+async def get_modal_title(page) -> str:
+    """Return the current modal/dialog title text, e.g. 'Create reel' or 'Edit reel'."""
+    for sel in ['[role="dialog"] h2', '[role="dialog"] [role="heading"]',
+                'h2', 'div[data-testid="reel-composer-title"]']:
+        try:
+            el = page.locator(sel).first
+            if await el.count() > 0:
+                txt = (await el.inner_text()).strip()
+                if txt:
+                    return txt
+        except Exception:
+            pass
+    return "unknown"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
@@ -111,7 +147,6 @@ async def upload_reel(caption: str, video_path: str):
             ]
         )
 
-        # ── Use DESKTOP context — mobile mbasic/lite doesn't have reel creation ──
         context = await browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -135,11 +170,10 @@ async def upload_reel(caption: str, video_path: str):
             await browser.close()
             return
         await context.add_cookies(cookies)
-
         page = await context.new_page()
 
-        # ── STEP 1: Load Facebook home (desktop) ──────────────────────────────
-        print("\n🌐 Opening Facebook (desktop)…")
+        # ── STEP 1: Load Facebook ─────────────────────────────────────────────
+        print("\n🌐 Opening Facebook…")
         try:
             await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=60_000)
         except Exception as e:
@@ -150,27 +184,20 @@ async def upload_reel(caption: str, video_path: str):
         await asyncio.sleep(8)
         await save_screenshot(page, "01_after_load")
 
-        # ── STEP 2: Check login ───────────────────────────────────────────────
+        # ── STEP 2: Verify login ──────────────────────────────────────────────
         print("🔍 Checking login…")
         if "login" in page.url or "checkpoint" in page.url:
-            print("❌ Not logged in — cookies expired")
+            print("❌ Not logged in")
             await save_screenshot(page, "02_login_failed")
             await browser.close()
             return
-
         login_ok = False
-        for sel in [
-            '[aria-label="Home"]',
-            '[data-pagelet="LeftRail"]',
-            'div[role="feed"]',
-            '[aria-label="Create"]',
-            'span:has-text("What\'s on your mind?")',
-        ]:
+        for sel in ['[aria-label="Home"]', '[data-pagelet="LeftRail"]',
+                    'div[role="feed"]', 'span:has-text("What\'s on your mind?")']:
             if await page.locator(sel).count() > 0:
                 login_ok = True
                 print(f"   ✅ Logged in (via {sel})")
                 break
-
         if not login_ok:
             print("❌ Login check failed")
             await dump_html(page, "02_login_failed.html")
@@ -179,37 +206,32 @@ async def upload_reel(caption: str, video_path: str):
             return
         await save_screenshot(page, "02_logged_in")
 
-        # ── STEP 3: Navigate to Reels creation (desktop URL) ──────────────────
-        print("\n🎬 Navigating to Reels create page…")
+        # ── STEP 3: Open Reels create page ───────────────────────────────────
+        print("\n🎬 Opening Reels creation page…")
         try:
-            await page.goto(
-                "https://www.facebook.com/reels/create/",
-                wait_until="domcontentloaded",
-                timeout=60_000,
-            )
+            await page.goto("https://www.facebook.com/reels/create/",
+                            wait_until="domcontentloaded", timeout=60_000)
         except Exception as e:
-            print(f"❌ Navigation failed: {e}")
+            print(f"❌ Nav failed: {e}")
             await save_screenshot(page, "03_nav_failed")
             await browser.close()
             return
-
         await asyncio.sleep(8)
-        await save_screenshot(page, "03_reels_create_page")
+        await save_screenshot(page, "03_reels_page")
         print(f"   URL: {page.url}")
+        title = await get_modal_title(page)
+        print(f"   Modal title: {title}")
 
-        # ── STEP 4: Attach video file ─────────────────────────────────────────
-        # Strategy A: direct hidden file input (desktop reels page has one)
-        # Strategy B: click "Select video from computer" button → file chooser
+        # ── STEP 4: Attach video ──────────────────────────────────────────────
         print("\n📁 Attaching video…")
-
         uploaded = False
 
-        # Strategy A — set_input_files on hidden input directly
+        # Strategy A: direct hidden file input
         for sel in ['input[type="file"][accept*="video"]', 'input[type="file"]']:
             try:
                 inp = page.locator(sel).first
                 if await inp.count() > 0:
-                    print(f"   🎯 Direct file input found: {sel}")
+                    print(f"   🎯 Direct file input: {sel}")
                     await inp.set_input_files(video_path)
                     print(f"   ✅ File attached via direct input")
                     uploaded = True
@@ -217,20 +239,14 @@ async def upload_reel(caption: str, video_path: str):
             except Exception as e:
                 print(f"   — Direct input failed ({sel}): {e}")
 
-        # Strategy B — click upload button, intercept file chooser dialog
+        # Strategy B: click upload button → file chooser
         if not uploaded:
-            upload_btn_selectors = [
+            for sel in [
                 'div[role="button"]:has-text("Select video")',
                 'div[role="button"]:has-text("Upload")',
-                'div[role="button"]:has-text("Add video")',
-                'span:has-text("Select video")',
-                'span:has-text("Select Video")',
                 '[aria-label="Select video"]',
-                # Desktop reels create page button
-                'div[aria-label="Add to reel"]',
-                'div:has-text("Select video from computer")',
-            ]
-            for sel in upload_btn_selectors:
+                'span:has-text("Select video from computer")',
+            ]:
                 el = page.locator(sel).first
                 if await el.count() > 0:
                     print(f"   🎯 Upload button: {sel}")
@@ -239,127 +255,150 @@ async def upload_reel(caption: str, video_path: str):
                             await el.click(force=True)
                         fc = await fc_info.value
                         await fc.set_files(video_path)
-                        print(f"   ✅ File attached via file chooser")
+                        print(f"   ✅ File via chooser")
                         uploaded = True
                         break
                     except Exception as e:
-                        print(f"   — File chooser failed: {e}")
-                else:
-                    print(f"   — Not found: {sel}")
-
-        await save_screenshot(page, "04_after_upload_attempt")
-        await dump_html(page, "04_page_state.html")
+                        print(f"   — Chooser failed: {e}")
 
         if not uploaded:
-            print("❌ Could not attach video — check 04_page_state.html")
+            print("❌ Could not attach video")
+            await dump_html(page, "04_upload_failed.html")
+            await save_screenshot(page, "04_upload_failed")
             await browser.close()
             return
 
-        # ── STEP 5: Wait for video processing ────────────────────────────────
-        print("\n⏳ Waiting for video to process (40 s)…")
-        await asyncio.sleep(40)
-        await save_screenshot(page, "05_after_processing")
+        # ── STEP 5: Wait for video to process ────────────────────────────────
+        print("\n⏳ Waiting for video to process (30 s)…")
+        await asyncio.sleep(30)
+        await save_screenshot(page, "05_video_processed")
+        title = await get_modal_title(page)
+        print(f"   Modal: {title}")
 
-        # ── STEP 6: Enter caption ─────────────────────────────────────────────
-        print("\n✍️  Entering caption…")
+        # ─────────────────────────────────────────────────────────────────────
+        # DYNAMIC STEP LOOP
+        # We don't know how many steps FB shows. We loop: detect what's on
+        # screen, act on it, then advance. Max 6 iterations to avoid loops.
+        # ─────────────────────────────────────────────────────────────────────
+        print("\n🔄 Starting dynamic step loop…")
+        caption_done = False
 
-        caption_selectors = [
-            'div[aria-label="Describe your reel"][contenteditable="true"]',
-            'div[aria-label*="description" i][contenteditable="true"]',
-            'div[aria-label*="caption" i][contenteditable="true"]',
-            'div[data-lexical-editor="true"]',
-            'div[role="textbox"][contenteditable="true"]',
-            'textarea[placeholder*="description" i]',
-            'textarea[placeholder*="caption" i]',
-            'textarea',
-            'div[contenteditable="true"]',
-        ]
+        for step_num in range(1, 7):
+            title = await get_modal_title(page)
+            print(f"\n--- Step {step_num}: modal='{title}' ---")
+            await save_screenshot(page, f"step{step_num:02d}_start")
 
-        caption_typed = False
-        for sel in caption_selectors:
+            # ── Detect Share button (final step) ─────────────────────────────
+            share_btn = page.locator('[aria-label="Share"][role="button"]').first
+            share_visible = False
             try:
-                field = page.locator(sel).first
-                if await field.count() == 0:
-                    continue
-                await field.wait_for(state="visible", timeout=8_000)
-                await field.click()
-                await asyncio.sleep(0.5)
-                await page.keyboard.type(caption, delay=50)
-                print(f"   ✅ Caption typed via: {sel}")
-                caption_typed = True
+                share_visible = await share_btn.is_visible()
+            except Exception:
+                pass
+
+            if share_visible:
+                print("   🎯 Share button visible — this is the final step")
+                # Type caption here if not done yet (some flows put caption here)
+                if not caption_done:
+                    await try_type_caption(page, caption)
+                    caption_done = True
+                await asyncio.sleep(1)
+                print("   📤 Clicking Share…")
+                ok = await force_tap(page, share_btn)
+                if ok:
+                    print("   ✅ Share clicked!")
+                    break
+                else:
+                    print("   ❌ Share click failed")
+                    await dump_html(page, f"step{step_num:02d}_share_failed.html")
+                    break
+
+            # ── Detect caption textarea (Edit reel step) ──────────────────────
+            # From HTML: aria-placeholder="Describe your reel..." data-lexical-editor="true"
+            caption_field = page.locator(
+                '[aria-placeholder="Describe your reel..."],'
+                '[data-lexical-editor="true"],'
+                'div[role="textbox"][contenteditable="true"]'
+            ).first
+            caption_visible = False
+            try:
+                caption_visible = await caption_field.is_visible()
+            except Exception:
+                pass
+
+            if caption_visible and not caption_done:
+                print("   ✍️  Caption field found — typing caption…")
+                typed = await try_type_caption(page, caption)
+                if typed:
+                    caption_done = True
+                    print("   ✅ Caption typed")
+                else:
+                    print("   ⚠️  Caption typing failed")
+                await asyncio.sleep(2)
+                await save_screenshot(page, f"step{step_num:02d}_caption_typed")
+
+            # ── Click Next to advance ─────────────────────────────────────────
+            print("   ➡️  Clicking Next…")
+            next_ok = await click_next(page)
+            if not next_ok:
+                print("   ⚠️  Next not found — dumping HTML and stopping")
+                await dump_html(page, f"step{step_num:02d}_no_next.html")
+                await save_screenshot(page, f"step{step_num:02d}_stuck")
                 break
-            except Exception as e:
-                print(f"   — {sel}: {e}")
 
-        if not caption_typed:
-            print("⚠️  Could not type caption — continuing to publish anyway")
-            await dump_html(page, "06_caption_failed.html")
-        else:
-            await asyncio.sleep(2)
+            print("   ✅ Next clicked — waiting 5 s for next screen…")
+            await asyncio.sleep(5)
 
-        await save_screenshot(page, "06_after_caption")
-
-        # ── STEP 7: Click Next (if present) then Publish/Share ────────────────
-        print("\n📤 Looking for Next / Publish / Share…")
-
-        # Handle multi-step flow: click Next until we reach Publish
-        for step_name, selectors in [
-            ("Next", [
-                'div[aria-label="Next"][role="button"]',
-                'div[role="button"]:has-text("Next")',
-                'span:has-text("Next")',
-                'button:has-text("Next")',
-            ]),
-            ("Publish/Share", [
-                'div[aria-label="Publish"][role="button"]',
-                'div[aria-label="Share now"][role="button"]',
-                'div[role="button"]:has-text("Publish")',
-                'div[role="button"]:has-text("Share now")',
-                'div[role="button"]:has-text("Share")',
-                'span:has-text("Publish")',
-                'span:has-text("Share now")',
-                'button[type="submit"]',
-            ]),
-        ]:
-            for sel in selectors:
-                try:
-                    btn = page.locator(sel).last
-                    if await btn.count() == 0:
-                        continue
-                    await btn.wait_for(state="visible", timeout=8_000)
-                    disabled = await btn.get_attribute("aria-disabled")
-                    if disabled == "true":
-                        print(f"   ⚠️  {step_name} button disabled: {sel}")
-                        continue
-                    ok = await force_tap(page, btn)
-                    if ok:
-                        print(f"   ✅ Clicked {step_name} via: {sel}")
-                        await asyncio.sleep(5)
-                        await save_screenshot(page, f"07_after_{step_name.lower().replace('/', '_')}")
-                        break
-                except Exception as e:
-                    print(f"   — {step_name} ({sel}): {e}")
-
-        # ── STEP 8: Wait and confirm ──────────────────────────────────────────
-        print("\n⏳ Waiting for reel to publish (25 s)…")
-        await asyncio.sleep(25)
-        await save_screenshot(page, "08_final_result")
-        await dump_html(page, "08_final_page.html")
+        # ── FINAL: Wait for publish confirmation ──────────────────────────────
+        print("\n⏳ Waiting for publish (20 s)…")
+        await asyncio.sleep(20)
+        await save_screenshot(page, "09_final_result")
+        await dump_html(page, "09_final_page.html")
 
         for sel in [
             'span:has-text("Your reel is now shared")',
+            'span:has-text("Your reel was shared")',
             'span:has-text("Reel posted")',
             'span:has-text("Published")',
-            'span:has-text("Your reel")',
-            'div:has-text("Your reel was shared")',
         ]:
             if await page.locator(sel).count() > 0:
                 print(f"🎉 Reel published! (confirmed: {sel})")
                 break
         else:
-            print("🎉 Process completed — check screenshots/08_final_result.png")
+            print("🎉 Process completed — check 09_final_result.png")
 
         await browser.close()
+
+
+async def try_type_caption(page, caption: str) -> bool:
+    """Try all known caption field selectors and type into the first visible one."""
+    selectors = [
+        # Confirmed from HTML dump: aria-placeholder + data-lexical-editor
+        '[aria-placeholder="Describe your reel..."]',
+        'div[data-lexical-editor="true"]',
+        'div[role="textbox"][contenteditable="true"]',
+        'div[contenteditable="true"]',
+        'textarea[placeholder*="escribe" i]',
+        'textarea',
+    ]
+    for sel in selectors:
+        try:
+            field = page.locator(sel).first
+            if await field.count() == 0:
+                continue
+            if not await field.is_visible():
+                continue
+            await field.click()
+            await asyncio.sleep(0.5)
+            # Clear any existing text first
+            await page.keyboard.press("Control+a")
+            await asyncio.sleep(0.2)
+            await page.keyboard.type(caption, delay=40)
+            print(f"      ✅ Typed via: {sel}")
+            return True
+        except Exception as e:
+            print(f"      — {sel}: {e}")
+    return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -371,6 +410,6 @@ if __name__ == "__main__":
         print(f"📝 Caption loaded from {CAPTIONS_TXT}")
     else:
         caption = "Check out my latest reel! #reels"
-        print(f"⚠️  {CAPTIONS_TXT} not found — using default caption")
+        print(f"⚠️  {CAPTIONS_TXT} not found — using default")
 
     asyncio.run(upload_reel(caption=caption, video_path=VIDEO_FILE))
