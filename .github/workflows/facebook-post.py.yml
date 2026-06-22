@@ -1,0 +1,37 @@
+name: Facebook Post
+
+on:
+  workflow_dispatch:
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Playwright
+        run: |
+          pip install playwright
+          playwright install chromium --with-deps
+
+      - name: Run Facebook Post Script
+        env:
+          TZ: "Asia/Karachi"
+        run: python post_facebook.py
+
+      - name: Upload Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: facebook-post-result
+          path: |
+            *.png
+            facebook_cookies.txt
+          retention-days: 7
