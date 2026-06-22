@@ -54,108 +54,97 @@ async def dump(page, name):
         print(f"⚠️  dump {name}: {e}")
 
 
-async def force_tap(page, loc):
-    box = await loc.bounding_box()
-    if box:
-        try:
-            await page.touchscreen.tap(box["x"] + box["width"]/2, box["y"] + box["height"]/2)
-            print("   ✅ tap")
-            return True
-        except Exception as e:
-            print(f"   — tap: {e}")
+async def click_element(page, locator, label="button"):
+    """
+    Desktop context — NO touchscreen.
+    Strategy 1: normal click (respects actionability)
+    Strategy 2: force click (bypasses overlap checks)
+    Strategy 3: JS click (last resort)
+    """
+    # Strategy 1 — normal click with short timeout
     try:
-        await loc.click(force=True, timeout=5_000)
-        print("   ✅ force-click")
+        await locator.click(timeout=5_000)
+        print(f"   ✅ click: {label}")
         return True
     except Exception as e:
-        print(f"   — force-click: {e}")
+        print(f"   — normal click failed ({label}): {e}")
+
+    # Strategy 2 — force click (skip actionability)
     try:
-        await loc.evaluate("el => el.click()")
-        print("   ✅ js-click")
+        await locator.click(force=True, timeout=5_000)
+        print(f"   ✅ force-click: {label}")
         return True
     except Exception as e:
-        print(f"   — js-click: {e}")
+        print(f"   — force-click failed ({label}): {e}")
+
+    # Strategy 3 — JS click
+    try:
+        await locator.evaluate("el => el.click()")
+        print(f"   ✅ js-click: {label}")
+        return True
+    except Exception as e:
+        print(f"   — js-click failed ({label}): {e}")
+
     return False
 
 
-# ── Caption field selectors confirmed from HTML dumps ─────────────────────────
-# From 08_final_page.html: aria-placeholder="Describe your reel..."
-# and data-lexical-editor="true" on the same div
-CAPTION_SELECTORS = [
-    '[aria-placeholder="Describe your reel..."]',          # ✅ confirmed
-    'div[data-lexical-editor="true"]',                     # ✅ confirmed
-    'div[role="textbox"][contenteditable="true"]',         # generic fallback
-    'textarea[placeholder*="escribe" i]',                  # textarea variant
-    'textarea[placeholder*="caption" i]',
-    'div[contenteditable="true"]',                         # last resort
-]
-
-# ── Next / Share button selectors confirmed from HTML dumps ──────────────────
-# From 04/08 HTML: aria-label="Next" and aria-label="Share" on role="button"
-NEXT_SELECTORS = [
-    '[aria-label="Next"][role="button"]',                  # ✅ confirmed
-    'div[role="button"]:has-text("Next")',
-    'span:has-text("Next")',
-]
-
-SHARE_SELECTORS = [
-    '[aria-label="Share"][role="button"]',                 # ✅ confirmed
-    'div[role="button"]:has-text("Share")',
-    'div[role="button"]:has-text("Publish")',
-    'span:has-text("Share")',
-    'span:has-text("Publish")',
-]
-
-
 async def find_visible(page, selectors, label="element"):
-    """Return the first visible locator from the selector list, or None."""
+    """Return first visible locator from list, or None."""
     for sel in selectors:
         try:
             loc = page.locator(sel).first
             if await loc.count() > 0 and await loc.is_visible():
-                print(f"   🎯 {label} found: {sel}")
-                return loc
+                print(f"   🎯 {label}: {sel}")
+                return loc, sel
         except Exception:
             pass
-    return None
+    return None, None
 
 
-async def type_caption(page, caption):
-    """Find the caption field (whichever selector matches) and type into it."""
-    loc = await find_visible(page, CAPTION_SELECTORS, "caption field")
-    if not loc:
-        print("   ❌ No caption field found")
-        return False
-    try:
-        await loc.click()
-        await asyncio.sleep(0.4)
-        await page.keyboard.press("Control+a")
-        await asyncio.sleep(0.2)
-        await page.keyboard.type(caption, delay=40)
-        print(f"   ✅ Caption typed ({len(caption)} chars)")
-        return True
-    except Exception as e:
-        print(f"   ❌ Typing failed: {e}")
-        return False
+# ── Confirmed selectors from HTML dumps ──────────────────────────────────────
+#
+# From 04_page_state.html (Create reel screen):
+#   Next:  div[aria-label="Next"][role="button"][tabindex="0"]  ← inside form[method="POST"]
+#   Input: input[accept*="video"][type="file"]
+#
+# From 08_final_page.html (Edit reel screen):
+#   Caption: div[aria-placeholder="Describe your reel..."][data-lexical-editor="true"]
+#   Share:   div[aria-label="Share"][role="button"]
+#
+# Scoped inside the modal: [aria-modal="true"] form ... to avoid hitting feed buttons
 
+NEXT_SELECTORS = [
+    # Scoped to modal form — most precise
+    '[aria-modal="true"] form [aria-label="Next"][role="button"]',
+    '[aria-modal="true"] [aria-label="Next"][role="button"]',
+    # Fallback unscoped
+    '[aria-label="Next"][role="button"]',
+    'div[role="button"]:has-text("Next")',
+]
 
-async def click_btn(page, selectors, label):
-    """Find and click first non-disabled visible button from selector list."""
-    loc = await find_visible(page, selectors, label)
-    if not loc:
-        print(f"   ❌ {label} button not found")
-        return False
-    try:
-        disabled = await loc.get_attribute("aria-disabled")
-        if disabled == "true":
-            print(f"   ⚠️  {label} is disabled")
-            return False
-    except Exception:
-        pass
-    return await force_tap(page, loc)
+CAPTION_SELECTORS = [
+    # Confirmed from 08_final_page.html
+    '[aria-placeholder="Describe your reel..."]',
+    'div[data-lexical-editor="true"]',
+    'div[role="textbox"][contenteditable="true"]',
+    'div[contenteditable="true"][aria-placeholder]',
+    'textarea[placeholder*="escribe" i]',
+    'textarea[placeholder*="caption" i]',
+    'div[contenteditable="true"]',
+]
 
+SHARE_SELECTORS = [
+    # Confirmed from 08_final_page.html
+    '[aria-modal="true"] [aria-label="Share"][role="button"]',
+    '[aria-label="Share"][role="button"]',
+    '[aria-label="Publish"][role="button"]',
+    '[aria-modal="true"] [aria-label="Post"][role="button"]',
+    '[aria-label="Post"][role="button"]',
+    'div[role="button"]:has-text("Share")',
+    'div[role="button"]:has-text("Publish")',
+    'div[role="button"]:has-text("Post")',
+]
 
-# ─────────────────────────────────────────────────────────────────────────────
 
 async def upload_reel(caption, video_path):
     if not Path(video_path).exists():
@@ -169,10 +158,13 @@ async def upload_reel(caption, video_path):
             "--disable-blink-features=AutomationControlled",
             "--disable-infobars", "--disable-dev-shm-usage",
         ])
+        # DESKTOP context — no is_mobile, no has_touch, no touchscreen
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             viewport={"width": 1280, "height": 900},
-            locale="en-US", timezone_id="Asia/Karachi", accept_downloads=True,
+            locale="en-US",
+            timezone_id="Asia/Karachi",
+            accept_downloads=True,
         )
 
         if not Path(COOKIES_TXT).exists():
@@ -183,27 +175,26 @@ async def upload_reel(caption, video_path):
         await context.add_cookies(cookies)
         page = await context.new_page()
 
-        # ── 1. Load Facebook ──────────────────────────────────────────────────
+        # ── 1. Login check ────────────────────────────────────────────────────
         print("\n🌐 Opening Facebook…")
         await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=60_000)
-        await asyncio.sleep(8)
+        await asyncio.sleep(7)
         await ss(page, "01_home")
 
         if "login" in page.url or "checkpoint" in page.url:
-            print("❌ Not logged in"); await ss(page, "01_login_fail"); await browser.close(); return
+            print("❌ Not logged in"); await browser.close(); return
 
-        login_ok = any([
-            await page.locator(s).count() > 0
-            for s in ['[aria-label="Home"]', 'div[role="feed"]', 'span:has-text("What\'s on your mind?")']
-        ])
+        login_ok = False
+        for s in ['[aria-label="Home"]', 'div[role="feed"]', 'span:has-text("What\'s on your mind?")']:
+            if await page.locator(s).count() > 0:
+                login_ok = True; print(f"   ✅ Logged in ({s})"); break
         if not login_ok:
-            print("❌ Login check failed"); await dump(page, "01_login_fail.html"); await browser.close(); return
-        print("   ✅ Logged in")
+            print("❌ Login failed"); await dump(page, "01_fail.html"); await browser.close(); return
 
         # ── 2. Open Reels create ──────────────────────────────────────────────
         print("\n🎬 Opening /reels/create/…")
         await page.goto("https://www.facebook.com/reels/create/", wait_until="domcontentloaded", timeout=60_000)
-        await asyncio.sleep(8)
+        await asyncio.sleep(7)
         await ss(page, "02_reels_page")
         print(f"   URL: {page.url}")
 
@@ -211,25 +202,28 @@ async def upload_reel(caption, video_path):
         print("\n📁 Attaching video…")
         uploaded = False
 
-        # Try direct hidden file input first
-        for sel in ['input[type="file"][accept*="video"]', 'input[type="file"]']:
+        # Confirmed from HTML: input[accept*="video"][type="file"] inside the modal
+        for sel in [
+            '[aria-modal="true"] input[type="file"][accept*="video"]',
+            'input[type="file"][accept*="video"]',
+            'input[type="file"]',
+        ]:
             try:
                 inp = page.locator(sel).first
                 if await inp.count() > 0:
                     await inp.set_input_files(video_path)
-                    print(f"   ✅ Attached via: {sel}")
+                    print(f"   ✅ Attached: {sel}")
                     uploaded = True
                     break
             except Exception as e:
                 print(f"   — {sel}: {e}")
 
-        # Fallback: click upload button → intercept file chooser
         if not uploaded:
+            # Fallback: click upload button → file chooser
             for sel in [
                 'div[role="button"]:has-text("Select video")',
                 '[aria-label="Select video"]',
                 'span:has-text("Select video from computer")',
-                'div[role="button"]:has-text("Upload")',
             ]:
                 el = page.locator(sel).first
                 if await el.count() > 0:
@@ -245,102 +239,109 @@ async def upload_reel(caption, video_path):
 
         if not uploaded:
             print("❌ Could not attach video")
-            await dump(page, "03_upload_fail.html"); await ss(page, "03_upload_fail")
+            await dump(page, "03_fail.html"); await ss(page, "03_fail")
             await browser.close(); return
 
-        await ss(page, "03_after_upload")
+        await ss(page, "03_uploaded")
 
         # ── 4. Wait for video to process ──────────────────────────────────────
-        print("\n⏳ Waiting 30 s for video to process…")
+        print("\n⏳ Waiting 30 s for video processing…")
         await asyncio.sleep(30)
         await ss(page, "04_processed")
 
-        # ── 5. DYNAMIC STEP LOOP ──────────────────────────────────────────────
-        # Detected flow from screenshots:
-        #   Screen 1 "Create reel"  → no caption field → click Next
-        #   Screen 2 "Edit reel"    → caption field appears → type → click Next
-        #   Screen 3               → Share button → click Share
+        # ── 5. STEP LOOP ──────────────────────────────────────────────────────
+        # Confirmed 3-step flow:
+        #   Screen 1 "Create reel": video preview  → no caption → click Next
+        #   Screen 2 "Edit reel":   caption field   → type       → click Next
+        #   Screen 3:               Share button    → click Share/Post/Publish
         #
-        # The loop checks EVERY screen for:
-        #   (a) caption field  → type if not done yet
-        #   (b) Share button   → click and finish
-        #   (c) Next button    → advance to next screen
-        # This handles any number of steps FB may add.
+        # Loop detects what's on screen each iteration and acts accordingly.
 
         caption_done = False
-        print("\n🔄 Dynamic step loop…")
+        print("\n🔄 Step loop starting…")
 
         for step in range(1, 8):
-            await ss(page, f"step{step:02d}")
-            print(f"\n── Step {step} ──────────────────────────────────────")
+            print(f"\n── Step {step} ─────────────────────────────────────")
+            await ss(page, f"step{step:02d}_start")
 
-            # (a) Caption field — type if visible and not done yet
+            # (a) Type caption if field is visible and not yet done
             if not caption_done:
-                cap_loc = await find_visible(page, CAPTION_SELECTORS, "caption")
+                cap_loc, cap_sel = await find_visible(page, CAPTION_SELECTORS, "caption field")
                 if cap_loc:
                     try:
                         await cap_loc.click()
-                        await asyncio.sleep(0.4)
+                        await asyncio.sleep(0.3)
                         await page.keyboard.press("Control+a")
                         await asyncio.sleep(0.2)
                         await page.keyboard.type(caption, delay=40)
-                        print(f"   ✅ Caption typed")
                         caption_done = True
+                        print(f"   ✅ Caption typed via: {cap_sel}")
                         await asyncio.sleep(1)
-                        await ss(page, f"step{step:02d}_caption_typed")
+                        await ss(page, f"step{step:02d}_captioned")
                     except Exception as e:
-                        print(f"   ⚠️  Caption type error: {e}")
+                        print(f"   ⚠️  Caption error: {e}")
 
-            # (b) Share/Publish button — final step
-            share_loc = await find_visible(page, SHARE_SELECTORS, "Share/Publish")
+            # (b) Share/Post/Publish = final step → click and exit
+            share_loc, share_sel = await find_visible(page, SHARE_SELECTORS, "Share/Post/Publish")
             if share_loc:
-                try:
-                    disabled = await share_loc.get_attribute("aria-disabled")
-                    if disabled == "true":
-                        print("   ⚠️  Share disabled — waiting 3 s…")
+                # Wait if disabled
+                for _ in range(3):
+                    try:
+                        disabled = await share_loc.get_attribute("aria-disabled")
+                        if disabled != "true":
+                            break
+                        print("   ⏳ Share disabled, waiting 3 s…")
                         await asyncio.sleep(3)
-                        share_loc = await find_visible(page, SHARE_SELECTORS, "Share/Publish retry")
-                except Exception:
-                    pass
+                        share_loc, share_sel = await find_visible(page, SHARE_SELECTORS, "Share retry")
+                    except Exception:
+                        break
+
                 if share_loc:
-                    ok = await force_tap(page, share_loc)
+                    ok = await click_element(page, share_loc, f"Share ({share_sel})")
                     if ok:
-                        print("   ✅ Share clicked — done!")
+                        print("   🎉 Share/Post clicked — waiting for publish…")
                         await asyncio.sleep(20)
                         await ss(page, "final_result")
                         await dump(page, "final_page.html")
                         break
                     else:
                         print("   ❌ Share click failed")
-                        await dump(page, f"step{step:02d}_share_fail.html")
+                        await dump(page, f"step{step:02d}_sharefail.html")
                         break
 
-            # (c) Next button — advance
-            next_loc = await find_visible(page, NEXT_SELECTORS, "Next")
+            # (c) Next button → advance to next screen
+            next_loc, next_sel = await find_visible(page, NEXT_SELECTORS, "Next")
             if next_loc:
-                try:
-                    disabled = await next_loc.get_attribute("aria-disabled")
-                    if disabled == "true":
-                        print("   ⚠️  Next disabled — waiting 3 s…")
-                        await asyncio.sleep(3)
-                        next_loc = await find_visible(page, NEXT_SELECTORS, "Next retry")
-                except Exception:
-                    pass
+                # Wait if disabled (video still uploading)
+                for wait in [0, 3, 5, 10]:
+                    if wait:
+                        print(f"   ⏳ Next disabled, waiting {wait} s…")
+                        await asyncio.sleep(wait)
+                        next_loc, next_sel = await find_visible(page, NEXT_SELECTORS, "Next retry")
+                        if not next_loc:
+                            break
+                    try:
+                        disabled = await next_loc.get_attribute("aria-disabled")
+                        if disabled != "true":
+                            break
+                    except Exception:
+                        break
+
                 if next_loc:
-                    ok = await force_tap(page, next_loc)
+                    ok = await click_element(page, next_loc, f"Next ({next_sel})")
                     if ok:
-                        print("   ✅ Next clicked — waiting 5 s…")
-                        await asyncio.sleep(5)
+                        print("   ✅ Next clicked — waiting 6 s…")
+                        await asyncio.sleep(6)
                         continue
 
-            # Nothing found — dump and stop
-            print("   ❌ No Next or Share found — stuck")
+            # Nothing actionable found
+            print("   ❌ No Next or Share/Post found — stuck")
             await dump(page, f"step{step:02d}_stuck.html")
             await ss(page, f"step{step:02d}_stuck")
             break
 
         else:
-            print("⚠️  Loop exhausted without finishing")
+            print("⚠️  Loop exhausted")
 
         # ── 6. Confirm ────────────────────────────────────────────────────────
         for sel in [
@@ -350,9 +351,9 @@ async def upload_reel(caption, video_path):
             'span:has-text("Published")',
         ]:
             if await page.locator(sel).count() > 0:
-                print(f"🎉 Confirmed published: {sel}"); break
+                print(f"🎉 Confirmed: {sel}"); break
         else:
-            print("🎉 Process complete — check final_result.png")
+            print("🎉 Done — check final_result.png")
 
         await browser.close()
 
@@ -361,5 +362,5 @@ if __name__ == "__main__":
     cap_path = Path(CAPTIONS_TXT)
     caption = cap_path.read_text(encoding="utf-8").strip() if cap_path.exists() \
               else "Check out my latest reel! #reels"
-    print(f"📝 Caption: {'loaded from ' + CAPTIONS_TXT if cap_path.exists() else 'default'}")
+    print(f"📝 {'Loaded from ' + CAPTIONS_TXT if cap_path.exists() else 'Default caption'}")
     asyncio.run(upload_reel(caption=caption, video_path=VIDEO_FILE))
