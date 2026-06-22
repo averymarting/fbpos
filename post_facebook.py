@@ -64,60 +64,67 @@ async def post_on_facebook(message: str = "Hello testing"):
             return
 
         page = await context.new_page()
+        
+        print("🌐 Opening Facebook...")
         await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=30000)
-        await asyncio.sleep(6)
+        await asyncio.sleep(8)
+        await page.screenshot(path="01_facebook_home.png")
 
-        print("🔄 Attempting to create post...")
+        print("🔄 Trying to open create post dialog...")
 
-        # Click on "What's on your mind?" 
+        # Try multiple ways to open post composer
         try:
-            # Multiple possible selectors (Facebook changes them often)
-            post_box = await page.wait_for_selector(
-                'div[role="button"]:has-text("What\'s on your mind?"), '
-                'span:has-text("What\'s on your mind?"), '
+            post_selectors = [
+                'div[role="button"]:has-text("What\'s on your mind?")',
+                'span:has-text("What\'s on your mind?")',
                 '[aria-label="Create a post"]',
-                timeout=15000
-            )
-            await post_box.click()
-            print("✅ Clicked on post box")
-            await asyncio.sleep(3)
+                'div.x1i10hfl.x1q0g3np'  # Common class pattern
+            ]
+            
+            for selector in post_selectors:
+                try:
+                    post_box = await page.wait_for_selector(selector, timeout=8000)
+                    if post_box:
+                        await post_box.click()
+                        print(f"✅ Clicked post box using: {selector}")
+                        break
+                except:
+                    continue
+            await asyncio.sleep(5)
+            await page.screenshot(path="02_post_box_opened.png")
         except Exception as e:
-            print(f"⚠️ Could not find post box: {e}")
-            await browser.close()
-            return
+            print(f"⚠️ Failed to open post box: {e}")
 
-        # Type the message
+        # Type message
         try:
-            editor = await page.wait_for_selector(
-                'div[role="textbox"], div[contenteditable="true"]',
-                timeout=10000
-            )
+            await page.wait_for_selector('div[role="textbox"], div[contenteditable="true"]', timeout=10000)
+            editor = page.locator('div[role="textbox"], div[contenteditable="true"]').first
             await editor.click()
             await editor.fill(message)
-            print(f"✅ Typed message: {message}")
-            await asyncio.sleep(2)
-        except:
-            print("⚠️ Could not type message")
-            await browser.close()
-            return
+            print(f"✅ Typed: {message}")
+            await asyncio.sleep(4)
+            await page.screenshot(path="03_message_typed.png")
+        except Exception as e:
+            print(f"⚠️ Failed to type message: {e}")
 
         # Click Post button
         try:
-            post_button = await page.wait_for_selector(
-                'div[role="button"]:has-text("Post"), button:has-text("Post")',
-                timeout=10000
-            )
+            print("📤 Clicking Post button...")
+            await page.wait_for_selector('div[role="button"]:has-text("Post")', timeout=10000)
+            post_button = page.locator('div[role="button"]:has-text("Post")').last
             await post_button.click()
             print("✅ Clicked Post button")
-            await asyncio.sleep(5)
-        except:
-            print("⚠️ Could not click Post button")
+            await asyncio.sleep(12)   # Increased wait time as requested
+            await page.screenshot(path="04_after_post_click.png")
+        except Exception as e:
+            print(f"⚠️ Failed to click Post: {e}")
 
-        # Take screenshot for verification
-        await page.screenshot(path="facebook_post_result.png")
-        print("📸 Screenshot saved: facebook_post_result.png")
+        # Extra wait to confirm post is published
+        print("⏳ Waiting 15 seconds to confirm post is shared...")
+        await asyncio.sleep(15)
+        await page.screenshot(path="05_final_result.png")
 
-        print("🎉 Post attempt completed!")
+        print("🎉 Post attempt finished. Check screenshots in artifacts.")
         await browser.close()
 
 
