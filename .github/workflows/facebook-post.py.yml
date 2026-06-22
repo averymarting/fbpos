@@ -1,9 +1,9 @@
-name: Facebook Post
+name: Facebook Reel Upload
 on:
   workflow_dispatch:
 
 jobs:
-  post:
+  upload-reel:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -19,19 +19,30 @@ jobs:
           pip install playwright
           playwright install chromium --with-deps
 
-      - name: Run Facebook Post Script
+      - name: Verify required files exist
+        run: |
+          echo "📁 Workspace contents:"
+          ls -lh
+          echo ""
+          echo "Checking required files…"
+          [ -f "facebook_cookies.txt" ] && echo "✅ facebook_cookies.txt found" || echo "❌ facebook_cookies.txt MISSING"
+          [ -f "captions.txt" ]         && echo "✅ captions.txt found"         || echo "❌ captions.txt MISSING"
+          [ -f "testing.mp4" ]          && echo "✅ testing.mp4 found"          || echo "❌ testing.mp4 MISSING"
+          [ -f "testing.mp4" ] && echo "   Video size: $(du -h testing.mp4 | cut -f1)"
+
+      - name: Upload Reel to Facebook
         env:
           TZ: "Asia/Karachi"
         run: python post_facebook.py
 
       - name: Upload Screenshots & Debug Files
-        if: always()   # run even if the step above fails
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: facebook-post-result
+          name: reel-upload-result
           path: |
             *.png
             screenshots/*.png
-            page_debug.html
+            *.html
           retention-days: 7
           if-no-files-found: warn
