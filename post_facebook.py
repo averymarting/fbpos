@@ -207,16 +207,20 @@ async def upload_reel(caption: str, video_path: str):
             # Facebook frequently rotates cookies/tokens during a session.
             # Capturing the state here — success OR failure — means next
             # run starts with fresher tokens instead of the original stale
-            # export. Print the JSON to logs so a workflow step can grab it
-            # and push it back into the GitHub secret.
+            # export. We write it to disk ONLY — we do NOT print it to the
+            # workflow logs. GitHub Actions log output is plaintext and can
+            # be visible to anyone with read access to the repo/run, so
+            # printing a live session token there would defeat the purpose
+            # of using a secret in the first place. A separate workflow
+            # step reads this file directly and pushes it back into the
+            # GH secret via `gh secret set`, with the file never logged.
             try:
                 fresh_state = await context.storage_state()
                 Path(STORAGE_STATE).write_text(json.dumps(fresh_state), encoding="utf-8")
                 print(f"\n💾 Saved refreshed storage_state to {STORAGE_STATE} "
                       f"({len(fresh_state.get('cookies', []))} cookies)")
-                print("STORAGE_STATE_JSON_START")
-                print(json.dumps(fresh_state))
-                print("STORAGE_STATE_JSON_END")
+                print("ℹ️  Refreshed session written to disk only (not printed to logs) — "
+                      "it contains live auth tokens.")
             except Exception as e:
                 print(f"⚠️  Could not save refreshed storage_state: {e}")
 
@@ -342,16 +346,6 @@ async def _run_upload_flow(context, caption: str, video_path: str):
         return
 
     # ── STEP 5: Click "Next" to advance from Create→Edit panel ───────────
-    # KEY FINDING from diagnostic HTML dumps: the caption field does NOT
-    # exist in the DOM on the initial "Create reel" upload screen at all —
-    # not as a timing issue, but structurally. It only gets mounted after
-    # advancing to the "Edit reel" panel (same one where Trim video, Closed
-    # captions, Audio description, etc. appear — see your screenshots).
-    # The real element looks like:
-    #   <div contenteditable="true" role="textbox" data-lexical-editor="true"
-    #        aria-placeholder="Describe your reel...">
-    # Note: aria-PLACEHOLDER, not aria-label — our old selector was checking
-    # the wrong attribute, which is why it never matched at any point.
     print("\n➡️  Clicking Next to reach Edit-reel panel (where caption field lives)…")
 
     first_next_clicked = False
@@ -418,8 +412,6 @@ async def _run_upload_flow(context, caption: str, video_path: str):
     # ── STEP 6: Enter caption — battery of selectors × battery of methods ──
     print("\n✍️  Entering caption…")
 
-    # Ordered by confidence, based on the ACTUAL element confirmed present
-    # in captured DOM dumps (aria-placeholder, not aria-label).
     caption_selectors = [
         ("aria-placeholder exact",  'div[contenteditable="true"][aria-placeholder="Describe your reel..."]'),
         ("aria-placeholder loose",  'div[contenteditable="true"][aria-placeholder*="Describe your reel" i]'),
@@ -442,19 +434,16 @@ async def _run_upload_flow(context, caption: str, video_path: str):
         except Exception:
             return False
 
-    # ── Method 1: standard click + keyboard.type ──────────────────────────
     async def method_keyboard_type(field) -> bool:
         await field.scroll_into_view_if_needed(timeout=5_000)
         await field.click(timeout=5_000)
         await asyncio.sleep(0.4)
-        await field.click(timeout=5_000)  # second click: ensure innermost node focused
+        await field.click(timeout=5_000)
         await asyncio.sleep(0.3)
         await page.keyboard.type(caption, delay=40)
         await asyncio.sleep(0.5)
         return await verify_caption_present(field)
 
-    # ── Method 2: click + press_sequentially (Playwright's char-by-char API,
-    #    dispatches real key events differently than .type() internally) ───
     async def method_press_sequentially(field) -> bool:
         await field.click(timeout=5_000)
         await asyncio.sleep(0.3)
@@ -462,8 +451,6 @@ async def _run_upload_flow(context, caption: str, video_path: str):
         await asyncio.sleep(0.5)
         return await verify_caption_present(field)
 
-    # ── Method 3: focus via JS, then keyboard.type (sometimes .click()
-    #    targets a wrapper; el.focus() in-page guarantees the right node) ──
     async def method_js_focus_then_keyboard(field) -> bool:
         await field.evaluate("el => el.focus()")
         await asyncio.sleep(0.3)
@@ -471,7 +458,6 @@ async def _run_upload_flow(context, caption: str, video_path: str):
         await asyncio.sleep(0.5)
         return await verify_caption_present(field)
 
-    # ── Method 4: execCommand insertText (Lexical/Draft.js honor this) ─────
     async def method_exec_command(field) -> bool:
         await field.click(timeout=5_000)
         await asyncio.sleep(0.3)
@@ -490,7 +476,6 @@ async def _run_upload_flow(context, caption: str, video_path: str):
         await asyncio.sleep(0.5)
         return await verify_caption_present(field)
 
-    # ── Method 5: direct textContent + synthetic input events ──────────────
     async def method_direct_dom_injection(field) -> bool:
         await field.evaluate(
             """(el, text) => {
@@ -509,8 +494,6 @@ async def _run_upload_flow(context, caption: str, video_path: str):
         await asyncio.sleep(0.5)
         return await verify_caption_present(field)
 
-    # ── Method 6: clipboard paste simulation (some Lexical builds only
-    #    accept text via a real 'paste' ClipboardEvent, not insertText) ─────
     async def method_paste_event(field) -> bool:
         await field.click(timeout=5_000)
         await asyncio.sleep(0.3)
@@ -529,8 +512,6 @@ async def _run_upload_flow(context, caption: str, video_path: str):
         await asyncio.sleep(0.5)
         return await verify_caption_present(field)
 
-    # ── Method 7: OS-level clipboard + Ctrl+V via keyboard (closest to a
-    #    real human paste — needs clipboard permissions on the context) ────
     async def method_real_clipboard_paste(field) -> bool:
         await field.click(timeout=5_000)
         await asyncio.sleep(0.3)
@@ -579,9 +560,6 @@ async def _run_upload_flow(context, caption: str, video_path: str):
 
         for method_name, method_fn in methods:
             try:
-                # Clear any partial text from a previous failed method before
-                # trying the next one, so verify_caption_present isn't fooled
-                # by leftovers from an earlier attempt on the same field.
                 await field.evaluate(
                     "el => { el.textContent = ''; el.innerText = ''; }"
                 )
@@ -617,15 +595,8 @@ async def _run_upload_flow(context, caption: str, video_path: str):
     await save_screenshot(page, "06_after_caption")
 
     # ── STEP 7: Click through any remaining Next steps, then click Post ───
-    # KEY FINDING from your screenshots: the final submission button's
-    # actual visible text is "Post" — NOT "Publish" or "Share now", which
-    # is why the previous selector list never matched it. The flow has
-    # THREE screens: Edit reel (caption) -> Reel settings (Public, Tag and
-    # collaborate, Boost reel, Scheduling options, ...) -> the "Post" button
-    # is at the bottom of THIS settings screen, not a separate Publish step.
     print("\n📤 Looking for Next, then the final Post button…")
 
-    # First: click "Next" to leave the Edit-reel/caption panel.
     for sel in [
         'div[aria-label="Next"][role="button"]',
         'div[role="button"]:has-text("Next")',
@@ -650,10 +621,6 @@ async def _run_upload_flow(context, caption: str, video_path: str):
         except Exception as e:
             print(f"   — Next ({sel}): {e}")
 
-    # ── Now find and click the real submit button: "Post" ─────────────────
-    # Battery of selectors, ordered by confidence (exact aria-label/text
-    # match first, broad fallbacks last), each tried with multiple click
-    # methods, with every combination tracked so failures are diagnosable.
     post_selectors = [
         ("aria-label Post exact",   'div[aria-label="Post"][role="button"]'),
         ("button text Post exact",  'div[role="button"]:text-is("Post")'),
@@ -700,11 +667,6 @@ async def _run_upload_flow(context, caption: str, video_path: str):
     ]
 
     async def settings_panel_still_open() -> bool:
-        """
-        Used to verify a click actually had an effect: if 'Reel settings'
-        text or the Post button itself is still present after a click
-        attempt, the click didn't really submit anything.
-        """
         try:
             still_has_post_btn = await page.locator(
                 'div[aria-label="Post"][role="button"]'
@@ -748,9 +710,6 @@ async def _run_upload_flow(context, caption: str, video_path: str):
                 await asyncio.sleep(2)
                 still_open_after = await settings_panel_still_open()
 
-                # A real successful submit should make the settings panel
-                # / Post button disappear (page navigates to feed or shows
-                # a "Published" confirmation).
                 if ok and still_open_before and not still_open_after:
                     status = "✅ SUCCESS (panel closed)"
                     print(f"      → {method_name}: {status}")
@@ -799,9 +758,6 @@ async def _run_upload_flow(context, caption: str, video_path: str):
             break
     else:
         print("🎉 Process completed — check screenshots/08_final_result.png")
-
-
-
 
 
 # ─────────────────────────────────────────────────────────────────────────────
