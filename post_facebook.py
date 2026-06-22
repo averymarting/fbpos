@@ -616,48 +616,170 @@ async def _run_upload_flow(context, caption: str, video_path: str):
 
     await save_screenshot(page, "06_after_caption")
 
-    # ── STEP 7: Click through any remaining Next steps, then Publish/Share ─
-    # Facebook's reel flow can have more than one screen after the caption
-    # panel (e.g. an audience/settings screen). This loop keeps clicking
-    # "Next" if it's still present and enabled, then finally Publish/Share.
-    print("\n📤 Looking for Next / Publish / Share…")
+    # ── STEP 7: Click through any remaining Next steps, then click Post ───
+    # KEY FINDING from your screenshots: the final submission button's
+    # actual visible text is "Post" — NOT "Publish" or "Share now", which
+    # is why the previous selector list never matched it. The flow has
+    # THREE screens: Edit reel (caption) -> Reel settings (Public, Tag and
+    # collaborate, Boost reel, Scheduling options, ...) -> the "Post" button
+    # is at the bottom of THIS settings screen, not a separate Publish step.
+    print("\n📤 Looking for Next, then the final Post button…")
 
-    for step_name, selectors in [
-        ("Next", [
-            'div[aria-label="Next"][role="button"]',
-            'div[role="button"]:has-text("Next")',
-            'span:has-text("Next")',
-            'button:has-text("Next")',
-        ]),
-        ("Publish/Share", [
-            'div[aria-label="Publish"][role="button"]',
-            'div[aria-label="Share now"][role="button"]',
-            'div[role="button"]:has-text("Publish")',
-            'div[role="button"]:has-text("Share now")',
-            'div[role="button"]:has-text("Share")',
-            'span:has-text("Publish")',
-            'span:has-text("Share now")',
-            'button[type="submit"]',
-        ]),
+    # First: click "Next" to leave the Edit-reel/caption panel.
+    for sel in [
+        'div[aria-label="Next"][role="button"]',
+        'div[role="button"]:has-text("Next")',
+        'span:has-text("Next")',
+        'button:has-text("Next")',
     ]:
-        for sel in selectors:
+        try:
+            btn = page.locator(sel).last
+            if await btn.count() == 0:
+                continue
+            await btn.wait_for(state="visible", timeout=8_000)
+            disabled = await btn.get_attribute("aria-disabled")
+            if disabled == "true":
+                print(f"   ⚠️  Next button disabled: {sel}")
+                continue
+            ok = await force_tap(page, btn)
+            if ok:
+                print(f"   ✅ Clicked Next via: {sel}")
+                await asyncio.sleep(3)
+                await save_screenshot(page, "07_after_next")
+                break
+        except Exception as e:
+            print(f"   — Next ({sel}): {e}")
+
+    # ── Now find and click the real submit button: "Post" ─────────────────
+    # Battery of selectors, ordered by confidence (exact aria-label/text
+    # match first, broad fallbacks last), each tried with multiple click
+    # methods, with every combination tracked so failures are diagnosable.
+    post_selectors = [
+        ("aria-label Post exact",   'div[aria-label="Post"][role="button"]'),
+        ("button text Post exact",  'div[role="button"]:text-is("Post")'),
+        ("span text Post exact",    'span:text-is("Post")'),
+        ("button[type=submit]",     'button[type="submit"]'),
+        ("aria-label Publish",      'div[aria-label="Publish"][role="button"]'),
+        ("aria-label Share now",    'div[aria-label="Share now"][role="button"]'),
+        ("text contains Post",      'div[role="button"]:has-text("Post")'),
+        ("text contains Publish",   'div[role="button"]:has-text("Publish")'),
+        ("text contains Share now", 'div[role="button"]:has-text("Share now")'),
+    ]
+
+    async def click_method_force_tap(loc) -> bool:
+        return await force_tap(page, loc)
+
+    async def click_method_dispatch_event(loc) -> bool:
+        try:
+            await loc.evaluate(
+                """el => {
+                    el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                    el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                    el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                }"""
+            )
+            return True
+        except Exception as e:
+            print(f"      dispatch_event failed: {e}")
+            return False
+
+    async def click_method_keyboard_enter(loc) -> bool:
+        try:
+            await loc.focus()
+            await asyncio.sleep(0.2)
+            await page.keyboard.press("Enter")
+            return True
+        except Exception as e:
+            print(f"      keyboard Enter failed: {e}")
+            return False
+
+    click_methods = [
+        ("force_tap (touch/force-click/JS chain)", click_method_force_tap),
+        ("synthetic mouse event dispatch",          click_method_dispatch_event),
+        ("focus + keyboard Enter",                  click_method_keyboard_enter),
+    ]
+
+    async def settings_panel_still_open() -> bool:
+        """
+        Used to verify a click actually had an effect: if 'Reel settings'
+        text or the Post button itself is still present after a click
+        attempt, the click didn't really submit anything.
+        """
+        try:
+            still_has_post_btn = await page.locator(
+                'div[aria-label="Post"][role="button"]'
+            ).count() > 0
+            still_has_heading = await page.locator(
+                'text="Reel settings"'
+            ).count() > 0
+            return still_has_post_btn or still_has_heading
+        except Exception:
+            return False
+
+    post_clicked = False
+    post_attempt_log = []
+
+    for sel_name, sel in post_selectors:
+        if post_clicked:
+            break
+        btn = page.locator(sel).last
+        count = await btn.count()
+        if count == 0:
+            post_attempt_log.append((sel_name, "—", "not found"))
+            continue
+
+        try:
+            await btn.wait_for(state="visible", timeout=5_000)
+        except Exception:
+            post_attempt_log.append((sel_name, "—", "found but not visible"))
+            continue
+
+        disabled = await btn.get_attribute("aria-disabled")
+        if disabled == "true":
+            post_attempt_log.append((sel_name, "—", "disabled"))
+            continue
+
+        print(f"   🎯 Selector candidate: {sel_name}  ({sel})")
+
+        for method_name, method_fn in click_methods:
             try:
-                btn = page.locator(sel).last
-                if await btn.count() == 0:
-                    continue
-                await btn.wait_for(state="visible", timeout=8_000)
-                disabled = await btn.get_attribute("aria-disabled")
-                if disabled == "true":
-                    print(f"   ⚠️  {step_name} button disabled: {sel}")
-                    continue
-                ok = await force_tap(page, btn)
-                if ok:
-                    print(f"   ✅ Clicked {step_name} via: {sel}")
-                    await asyncio.sleep(5)
-                    await save_screenshot(page, f"07_after_{step_name.lower().replace('/', '_')}")
+                still_open_before = await settings_panel_still_open()
+                ok = await method_fn(btn)
+                await asyncio.sleep(2)
+                still_open_after = await settings_panel_still_open()
+
+                # A real successful submit should make the settings panel
+                # / Post button disappear (page navigates to feed or shows
+                # a "Published" confirmation).
+                if ok and still_open_before and not still_open_after:
+                    status = "✅ SUCCESS (panel closed)"
+                    print(f"      → {method_name}: {status}")
+                    post_attempt_log.append((sel_name, method_name, status))
+                    post_clicked = True
                     break
+                elif ok:
+                    status = "⚠️ click fired but panel still open"
+                    print(f"      → {method_name}: {status}")
+                    post_attempt_log.append((sel_name, method_name, status))
+                else:
+                    status = "✗ click failed"
+                    print(f"      → {method_name}: {status}")
+                    post_attempt_log.append((sel_name, method_name, status))
             except Exception as e:
-                print(f"   — {step_name} ({sel}): {e}")
+                print(f"      → {method_name}: ✗ exception: {e}")
+                post_attempt_log.append((sel_name, method_name, f"exception: {e}"))
+
+    print("\n   📊 Post-button attempt summary:")
+    for sel_name, method_name, status in post_attempt_log:
+        print(f"      [{sel_name}] x [{method_name}] -> {status}")
+
+    if post_clicked:
+        print("\n   ✅ Post button click confirmed (settings panel closed)")
+    else:
+        print("\n⚠️  Could not confirm Post button click — check 07_post_failed.html / screenshot")
+        await dump_html(page, "07_post_failed.html")
+
+    await save_screenshot(page, "07_after_post_attempt")
 
     # ── STEP 8: Wait and confirm ──────────────────────────────────────────
     print("\n⏳ Waiting for reel to publish (25 s)…")
