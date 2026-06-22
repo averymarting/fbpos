@@ -1,12 +1,10 @@
 name: Facebook Post
-
 on:
   workflow_dispatch:
 
 jobs:
   post:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -26,12 +24,14 @@ jobs:
           TZ: "Asia/Karachi"
         run: python post_facebook.py
 
-      - name: Upload Results
-        if: always()
+      - name: Upload Screenshots & Debug Files
+        if: always()   # run even if the step above fails
         uses: actions/upload-artifact@v4
         with:
           name: facebook-post-result
           path: |
             *.png
-            facebook_cookies.txt
+            screenshots/*.png
+            page_debug.html
           retention-days: 7
+          if-no-files-found: warn
