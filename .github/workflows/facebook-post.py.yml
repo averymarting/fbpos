@@ -19,21 +19,52 @@ jobs:
           pip install playwright
           playwright install chromium --with-deps
 
-      - name: Verify required files exist
+      - name: Verify required files / secrets exist
+        env:
+          FB_STORAGE_STATE: ${{ secrets.FB_STORAGE_STATE }}
         run: |
           echo "📁 Workspace contents:"
           ls -lh
           echo ""
-          echo "Checking required files…"
-          [ -f "facebook_cookies.txt" ] && echo "✅ facebook_cookies.txt found" || echo "❌ facebook_cookies.txt MISSING"
-          [ -f "captions.txt" ]         && echo "✅ captions.txt found"         || echo "❌ captions.txt MISSING"
-          [ -f "testing.mp4" ]          && echo "✅ testing.mp4 found"          || echo "❌ testing.mp4 MISSING"
+          echo "Checking required inputs…"
+          if [ -n "$FB_STORAGE_STATE" ]; then
+            echo "✅ FB_STORAGE_STATE secret is set"
+          else
+            echo "❌ FB_STORAGE_STATE secret MISSING — add it in repo Settings > Secrets and variables > Actions"
+          fi
+          [ -f "captions.txt" ] && echo "✅ captions.txt found" || echo "❌ captions.txt MISSING"
+          [ -f "testing.mp4" ]  && echo "✅ testing.mp4 found"  || echo "❌ testing.mp4 MISSING"
           [ -f "testing.mp4" ] && echo "   Video size: $(du -h testing.mp4 | cut -f1)"
 
       - name: Upload Reel to Facebook
         env:
           TZ: "Asia/Karachi"
+          FB_STORAGE_STATE: ${{ secrets.FB_STORAGE_STATE }}
         run: python post_facebook.py
+
+      # ── Optional: keep the secret fresh ─────────────────────────────────
+      # post_facebook.py writes the rotated session to storage_state.json
+      # on disk (it deliberately never prints it to the logs). This step
+      # pushes that file straight into the repo secret so next run starts
+      # with current tokens instead of the original stale export.
+      #
+      # Requires one extra secret: GH_PAT — a fine-grained Personal Access
+      # Token scoped to ONLY this repo, with "Secrets" repository
+      # permission set to Read & write. Create it under your GitHub
+      # account → Settings → Developer settings → Personal access tokens.
+      #
+      # Delete this step if you'd rather refresh the secret manually.
+      - name: Refresh FB_STORAGE_STATE secret
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -f "storage_state.json" ]; then
+            gh secret set FB_STORAGE_STATE --repo "${{ github.repository }}" < storage_state.json
+            echo "✅ FB_STORAGE_STATE secret refreshed for next run"
+          else
+            echo "⚠️ storage_state.json not found on disk — skipping secret refresh"
+          fi
 
       - name: Upload Screenshots & Debug Files
         if: always()
