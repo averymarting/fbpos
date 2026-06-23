@@ -4,7 +4,7 @@ post_facebook.py
 • Downloads the next video from Google Drive folder GDRIVE_UPLOAD_FOLDER_ID
 • Uploads it as a Facebook Reel
 • On confirmed success, moves the file to GDRIVE_UPLOADED_FOLDER_ID
-• Runs every 2 hours via the built-in scheduler (or once via --once flag)
+• Runs every 30 minutes via the built-in scheduler (or once via --once flag)
 
 Environment variables / GitHub Secrets required:
   FB_STORAGE_STATE          – full JSON of Playwright storage_state
@@ -12,6 +12,7 @@ Environment variables / GitHub Secrets required:
   GDRIVE_UPLOAD_FOLDER_ID   – ID of the folder that holds pending videos
   GDRIVE_UPLOADED_FOLDER_ID – ID of the "fbuploaded" destination folder
   CAPTIONS_FILE_ID          – (optional) Google Drive file ID of captions.txt
+  LOOP_INTERVAL_MINUTES     – (optional) minutes between posts (default: 30)
 """
 
 import asyncio
@@ -57,7 +58,9 @@ UPLOAD_FOLDER_ENV         = "GDRIVE_UPLOAD_FOLDER_ID"
 UPLOADED_FOLDER_ENV       = "GDRIVE_UPLOADED_FOLDER_ID"
 CAPTIONS_FILE_ENV         = "CAPTIONS_FILE_ID"
 
-UPLOAD_INTERVAL_HOURS     = 2
+# ── Interval: LOOP_INTERVAL_MINUTES env overrides the default 30 ──────────────
+LOOP_INTERVAL_MINUTES     = int(os.environ.get("LOOP_INTERVAL_MINUTES", 30))
+
 VIDEO_EXTENSIONS          = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1032,7 +1035,7 @@ def run_once():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Scheduler
+# Scheduler — posts every LOOP_INTERVAL_MINUTES, runs forever
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_scheduled():
@@ -1040,16 +1043,22 @@ def run_scheduled():
         print("❌ 'schedule' package not installed. Run: pip install schedule")
         sys.exit(1)
 
-    print(f"⏰ Scheduler started — uploading every {UPLOAD_INTERVAL_HOURS} hours")
-    print("   Run --once to execute immediately without scheduling")
+    print(f"⏰ Scheduler started — posting every {LOOP_INTERVAL_MINUTES} minute(s)")
+    print(f"   Override interval via LOOP_INTERVAL_MINUTES env var (currently: {LOOP_INTERVAL_MINUTES})")
+    print("   Run with --once to execute immediately without scheduling\n")
 
-    # Run immediately on start, then every 2 hours
+    # Run immediately on start, then on the fixed interval
     run_once()
-    schedule.every(UPLOAD_INTERVAL_HOURS).hours.do(run_once)
+    schedule.every(LOOP_INTERVAL_MINUTES).minutes.do(run_once)
 
+    iteration = 0
     while True:
         schedule.run_pending()
-        time.sleep(30)
+        time.sleep(30)           # check every 30 s
+        iteration += 1
+        if iteration % 20 == 0:  # heartbeat every ~10 min
+            next_run = schedule.next_run()
+            print(f"⏳ Scheduler alive — next run at {next_run.strftime('%H:%M:%S') if next_run else 'unknown'}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
