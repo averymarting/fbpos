@@ -1,27 +1,39 @@
 name: Facebook Reel Upload
 on:
   workflow_dispatch:
-
+    inputs:
+      gdrive_upload_folder_id:
+        description: "Google Drive folder ID holding pending videos"
+        required: true
+        type: string
+      gdrive_uploaded_folder_id:
+        description: "Google Drive folder ID to move videos to after a successful upload"
+        required: true
+        type: string
+      captions_file_id:
+        description: "(Optional) Google Drive file ID of captions.txt"
+        required: false
+        type: string
 jobs:
   upload-reel:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: Install Playwright
+      - name: Install dependencies
         run: |
-          pip install playwright
+          pip install playwright schedule google-auth google-auth-httplib2 google-api-python-client
           playwright install chromium --with-deps
-
-      - name: Verify required files / secrets exist
+      - name: Verify required inputs / secrets exist
         env:
           FB_STORAGE_STATE: ${{ secrets.FB_STORAGE_STATE }}
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          GDRIVE_UPLOAD_FOLDER_ID: ${{ inputs.gdrive_upload_folder_id }}
+          GDRIVE_UPLOADED_FOLDER_ID: ${{ inputs.gdrive_uploaded_folder_id }}
         run: |
           echo "📁 Workspace contents:"
           ls -lh
@@ -32,16 +44,30 @@ jobs:
           else
             echo "❌ FB_STORAGE_STATE secret MISSING — add it in repo Settings > Secrets and variables > Actions"
           fi
-          [ -f "captions.txt" ] && echo "✅ captions.txt found" || echo "❌ captions.txt MISSING"
-          [ -f "testing.mp4" ]  && echo "✅ testing.mp4 found"  || echo "❌ testing.mp4 MISSING"
-          [ -f "testing.mp4" ] && echo "   Video size: $(du -h testing.mp4 | cut -f1)"
-
+          if [ -n "$GOOGLE_CREDENTIALS_JSON" ]; then
+            echo "✅ GOOGLE_CREDENTIALS_JSON secret is set"
+          else
+            echo "❌ GOOGLE_CREDENTIALS_JSON secret MISSING — add it in repo Settings > Secrets and variables > Actions"
+          fi
+          if [ -n "$GDRIVE_UPLOAD_FOLDER_ID" ]; then
+            echo "✅ Upload folder ID provided: $GDRIVE_UPLOAD_FOLDER_ID"
+          else
+            echo "❌ gdrive_upload_folder_id input MISSING"
+          fi
+          if [ -n "$GDRIVE_UPLOADED_FOLDER_ID" ]; then
+            echo "✅ Uploaded folder ID provided: $GDRIVE_UPLOADED_FOLDER_ID"
+          else
+            echo "❌ gdrive_uploaded_folder_id input MISSING"
+          fi
       - name: Upload Reel to Facebook
         env:
           TZ: "Asia/Karachi"
           FB_STORAGE_STATE: ${{ secrets.FB_STORAGE_STATE }}
-        run: python post_facebook.py
-
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          GDRIVE_UPLOAD_FOLDER_ID: ${{ inputs.gdrive_upload_folder_id }}
+          GDRIVE_UPLOADED_FOLDER_ID: ${{ inputs.gdrive_uploaded_folder_id }}
+          CAPTIONS_FILE_ID: ${{ inputs.captions_file_id }}
+        run: python post_facebook.py --once
       # ── Optional: keep the secret fresh ─────────────────────────────────
       # post_facebook.py writes the rotated session to storage_state.json
       # on disk (it deliberately never prints it to the logs). This step
@@ -65,7 +91,6 @@ jobs:
           else
             echo "⚠️ storage_state.json not found on disk — skipping secret refresh"
           fi
-
       - name: Upload Screenshots & Debug Files
         if: always()
         uses: actions/upload-artifact@v4
