@@ -50,6 +50,8 @@ jobs:
       # ── 3. Dependencies ──────────────────────────────────────────────────
       - name: Install dependencies
         run: |
+          SECONDS=$(( ${{ inputs.max_runtime_minutes }} * 60 ))
+          timeout ${SECONDS} python -u post_facebook.py || true
           pip install playwright schedule \
                       google-auth google-auth-httplib2 google-api-python-client
           playwright install chromium --with-deps
