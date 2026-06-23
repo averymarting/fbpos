@@ -1,29 +1,17 @@
 """
-post_facebook.py
-────────────────
-• Downloads the next video from Google Drive folder GDRIVE_UPLOAD_FOLDER_ID
-• Uploads it as a Facebook Reel
-• On confirmed success, moves the file to GDRIVE_UPLOADED_FOLDER_ID
-• Runs every 30 minutes via the built-in scheduler (or once via --once flag)
-
-Environment variables / GitHub Secrets required:
-  FB_STORAGE_STATE          – full JSON of Playwright storage_state
-  GOOGLE_CREDENTIALS_JSON   – full JSON of Google OAuth credentials file
-  GDRIVE_UPLOAD_FOLDER_ID   – ID of the folder that holds pending videos
-  GDRIVE_UPLOADED_FOLDER_ID – ID of the "fbuploaded" destination folder
-  CAPTIONS_FILE_ID          – (optional) Google Drive file ID of captions.txt
-  LOOP_INTERVAL_MINUTES     – (optional) minutes between posts (default: 30)
+post_facebook.py  — VERBOSE DEBUG VERSION
+─────────────────────────────────────────
+Every step prints exactly what it's doing and why it failed.
+Run with:  python -u post_facebook.py --once
 """
 
-import asyncio
-import io
-import json
-import os
-import sys
-import tempfile
-import time
+import asyncio, io, json, os, sys, tempfile, time
 from pathlib import Path
 from datetime import datetime
+import functools
+
+# Force unbuffered output — every print shows immediately in GitHub Actions
+print = functools.partial(print, flush=True)
 
 # ── optional scheduler ────────────────────────────────────────────────────────
 try:
@@ -41,14 +29,12 @@ try:
     HAS_GDRIVE = True
 except ImportError:
     HAS_GDRIVE = False
+    print("⚠️  Google Drive libraries not installed")
 
 from playwright.async_api import async_playwright
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Config — all overridable via environment
-# ─────────────────────────────────────────────────────────────────────────────
 STORAGE_STATE         = "storage_state.json"
-COOKIES_TXT           = "facebook_cookies.txt"
 CAPTIONS_TXT          = "captions.txt"
 SCREENSHOTS_DIR       = Path("screenshots")
 
@@ -57,29 +43,57 @@ GDRIVE_CREDS_ENV          = "GOOGLE_CREDENTIALS_JSON"
 UPLOAD_FOLDER_ENV         = "GDRIVE_UPLOAD_FOLDER_ID"
 UPLOADED_FOLDER_ENV       = "GDRIVE_UPLOADED_FOLDER_ID"
 CAPTIONS_FILE_ENV         = "CAPTIONS_FILE_ID"
-
-# ── Interval: LOOP_INTERVAL_MINUTES env overrides the default 30 ──────────────
 LOOP_INTERVAL_MINUTES     = int(os.environ.get("LOOP_INTERVAL_MINUTES", 30))
-
 VIDEO_EXTENSIONS          = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP LOGGER — prints a clear numbered banner for every major step
+# ─────────────────────────────────────────────────────────────────────────────
+_step = 0
+def step(msg):
+    global _step
+    _step += 1
+    print(f"\n{'='*60}")
+    print(f"  STEP {_step}: {msg}")
+    print(f"{'='*60}")
+
+def info(msg):   print(f"   ℹ️  {msg}")
+def ok(msg):     print(f"   ✅ {msg}")
+def warn(msg):   print(f"   ⚠️  {msg}")
+def fail(msg):   print(f"   ❌ {msg}")
+def debug(msg):  print(f"   🔍 {msg}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Google Drive helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_drive_service():
-    """Build and return an authenticated Drive v3 service, refreshing token if needed."""
+    step("Building Google Drive service")
     if not HAS_GDRIVE:
-        raise RuntimeError(
-            "google-auth / google-api-python-client not installed.\n"
-            "Run: pip install google-auth google-auth-httplib2 google-api-python-client"
-        )
+        fail("google-auth not installed")
+        raise RuntimeError("Missing google-auth libraries")
 
     creds_json = os.environ.get(GDRIVE_CREDS_ENV)
     if not creds_json:
-        raise RuntimeError(f"❌ Env var {GDRIVE_CREDS_ENV} not set")
+        fail(f"Env var {GDRIVE_CREDS_ENV} is not set")
+        raise RuntimeError(f"Missing {GDRIVE_CREDS_ENV}")
+    
+    info(f"GOOGLE_CREDENTIALS_JSON length: {len(creds_json)} chars")
+    
+    try:
+        creds_data = json.loads(creds_json)
+    except json.JSONDecodeError as e:
+        fail(f"GOOGLE_CREDENTIALS_JSON is not valid JSON: {e}")
+        raise
 
-    creds_data = json.loads(creds_json)
+    info(f"Credential keys present: {list(creds_data.keys())}")
+    
+    # Check for required fields
+    for field in ["token", "refresh_token", "client_id", "client_secret"]:
+        if creds_data.get(field):
+            ok(f"  {field}: present")
+        else:
+            warn(f"  {field}: MISSING or empty")
 
     creds = Credentials(
         token         = creds_data.get("token"),
@@ -89,83 +103,99 @@ def build_drive_service():
         client_secret = creds_data.get("client_secret"),
         scopes        = creds_data.get("scopes", ["https://www.googleapis.com/auth/drive"]),
     )
+    info(f"Token expired: {creds.expired}")
+    info(f"Has refresh_token: {bool(creds.refresh_token)}")
 
-    # Auto-refresh if expired
     if creds.expired and creds.refresh_token:
-        print("🔄 Google token expired — refreshing…")
-        creds.refresh(Request())
-        print("✅ Google token refreshed")
+        info("Refreshing expired Google token...")
+        try:
+            creds.refresh(Request())
+            ok("Google token refreshed successfully")
+        except Exception as e:
+            fail(f"Token refresh failed: {e}")
+            raise
 
-    return build("drive", "v3", credentials=creds, cache_discovery=False)
+    service = build("drive", "v3", credentials=creds, cache_discovery=False)
+    ok("Google Drive service built")
+    return service
 
 
 def gdrive_list_videos(service, folder_id: str) -> list[dict]:
-    """Return list of video files in folder, oldest first."""
-    ext_filter = " or ".join(
-        f"name contains '{ext}'" for ext in VIDEO_EXTENSIONS
-    )
-    query = (
-        f"'{folder_id}' in parents "
-        f"and trashed = false "
-        f"and ({ext_filter})"
-    )
-    result = service.files().list(
-        q=query,
-        fields="files(id, name, mimeType, createdTime, size)",
-        orderBy="createdTime",
-        pageSize=10,
-    ).execute()
+    step(f"Listing videos in Drive folder: {folder_id}")
+    ext_filter = " or ".join(f"name contains '{ext}'" for ext in VIDEO_EXTENSIONS)
+    query = f"'{folder_id}' in parents and trashed = false and ({ext_filter})"
+    info(f"Query: {query}")
+    
+    try:
+        result = service.files().list(
+            q=query,
+            fields="files(id, name, mimeType, createdTime, size)",
+            orderBy="createdTime",
+            pageSize=10,
+        ).execute()
+    except Exception as e:
+        fail(f"Drive API list failed: {e}")
+        raise
+
     files = result.get("files", [])
-    print(f"📂 Found {len(files)} video(s) in upload folder")
+    info(f"Found {len(files)} video(s)")
     for f in files:
         size_mb = int(f.get("size", 0)) // (1024 * 1024)
-        print(f"   • {f['name']}  ({size_mb} MB)  id={f['id']}")
+        info(f"  • {f['name']}  ({size_mb} MB)  id={f['id']}")
     return files
 
 
 def gdrive_download_video(service, file_id: str, file_name: str, dest_dir: str) -> str:
-    """Download a Drive file to dest_dir. Returns local path."""
+    step(f"Downloading video: {file_name} (id={file_id})")
     dest_path = os.path.join(dest_dir, file_name)
-    print(f"⬇️  Downloading {file_name} …")
-    request = service.files().get_media(fileId=file_id)
-    with io.FileIO(dest_path, "wb") as fh:
-        downloader = MediaIoBaseDownload(fh, request, chunksize=8 * 1024 * 1024)
-        done = False
-        while not done:
-            status, done = downloader.next_chunk()
-            if status:
-                print(f"   {int(status.progress() * 100)}%", end="\r")
+    
+    try:
+        request = service.files().get_media(fileId=file_id)
+        with io.FileIO(dest_path, "wb") as fh:
+            downloader = MediaIoBaseDownload(fh, request, chunksize=8 * 1024 * 1024)
+            done = False
+            while not done:
+                status, done = downloader.next_chunk()
+                if status:
+                    print(f"   📥 {int(status.progress() * 100)}%", end="\r")
+        print()  # newline after progress
+    except Exception as e:
+        fail(f"Download failed: {e}")
+        raise
+
     size_mb = os.path.getsize(dest_path) // (1024 * 1024)
-    print(f"\n✅ Downloaded: {dest_path}  ({size_mb} MB)")
+    ok(f"Downloaded to: {dest_path}  ({size_mb} MB)")
     return dest_path
 
 
-def gdrive_move_to_uploaded(service, file_id: str, file_name: str,
-                             src_folder_id: str, dst_folder_id: str):
-    """Move a file from upload folder → fbuploaded folder."""
-    print(f"📦 Moving '{file_name}' → fbuploaded folder…")
-    service.files().update(
-        fileId=file_id,
-        addParents=dst_folder_id,
-        removeParents=src_folder_id,
-        fields="id, parents",
-    ).execute()
-    print(f"✅ Moved to fbuploaded: {file_name}")
+def gdrive_move_to_uploaded(service, file_id, file_name, src_folder_id, dst_folder_id):
+    step(f"Moving '{file_name}' to uploaded folder")
+    try:
+        service.files().update(
+            fileId=file_id,
+            addParents=dst_folder_id,
+            removeParents=src_folder_id,
+            fields="id, parents",
+        ).execute()
+        ok(f"Moved successfully")
+    except Exception as e:
+        fail(f"Move failed: {e}")
+        raise
 
 
 def gdrive_get_caption(service) -> str | None:
-    """Download captions.txt from Drive if CAPTIONS_FILE_ID is set."""
+    step("Fetching caption from Google Drive")
     file_id = os.environ.get(CAPTIONS_FILE_ENV)
     if not file_id:
+        info("CAPTIONS_FILE_ID not set — skipping Drive caption fetch")
         return None
     try:
-        print("📝 Fetching captions.txt from Google Drive…")
         content = service.files().get_media(fileId=file_id).execute()
         text = content.decode("utf-8").strip() if isinstance(content, bytes) else content.strip()
-        print(f"✅ Caption fetched ({len(text)} chars)")
+        ok(f"Caption fetched ({len(text)} chars): {text[:80]}")
         return text
     except Exception as e:
-        print(f"⚠️  Could not fetch captions from Drive: {e}")
+        warn(f"Could not fetch captions: {e}")
         return None
 
 
@@ -174,44 +204,28 @@ def gdrive_get_caption(service) -> str | None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def resolve_fb_storage_state() -> str | None:
+    step("Resolving Facebook storage state")
     env_val = os.environ.get(FB_STORAGE_STATE_ENV)
     if env_val:
+        info(f"FB_STORAGE_STATE env var found, length={len(env_val)}")
         try:
-            json.loads(env_val)
+            parsed = json.loads(env_val)
+            cookies = parsed.get("cookies", [])
+            ok(f"Valid JSON — {len(cookies)} cookies found")
+            for c in cookies:
+                info(f"  Cookie: name={c.get('name')} expires={c.get('expires')} domain={c.get('domain')}")
             return env_val
-        except json.JSONDecodeError:
-            print(f"⚠️  {FB_STORAGE_STATE_ENV} is not valid JSON — ignoring")
+        except json.JSONDecodeError as e:
+            fail(f"FB_STORAGE_STATE is not valid JSON: {e}")
+    else:
+        warn("FB_STORAGE_STATE env var not set")
+    
     if Path(STORAGE_STATE).exists():
+        info(f"Found local {STORAGE_STATE} — using it")
         return Path(STORAGE_STATE).read_text(encoding="utf-8")
+    
+    fail("No valid Facebook session found!")
     return None
-
-
-def load_netscape_cookies(txt_file: str):
-    cookies = []
-    with open(txt_file, "r", encoding="utf-8") as f:
-        for line_num, line in enumerate(f, 1):
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = line.split("\t")
-            if len(parts) < 7:
-                parts = line.split()
-            if len(parts) < 7:
-                print(f"⚠️  Skipping malformed cookie line {line_num}")
-                continue
-            domain, _, path, secure_s, expires, name, value = parts[:7]
-            cookie = {
-                "name": name, "value": value,
-                "domain": domain if domain.startswith(".") else f".{domain}",
-                "path": path, "secure": secure_s.upper() == "TRUE",
-                "httpOnly": False,
-                "sameSite": "None" if secure_s.upper() == "TRUE" else "Lax",
-            }
-            if expires.lstrip("-").isdigit() and int(expires) > 0:
-                cookie["expires"] = int(expires)
-            cookies.append(cookie)
-    print(f"✅ Loaded {len(cookies)} cookies (legacy)")
-    return cookies
 
 
 async def save_screenshot(page, name: str):
@@ -219,17 +233,33 @@ async def save_screenshot(page, name: str):
     for p in [SCREENSHOTS_DIR / f"{name}.png", Path(f"{name}.png")]:
         try:
             await page.screenshot(path=str(p), full_page=False)
-            print(f"📸 {p}")
+            info(f"Screenshot saved: {p}")
         except Exception as e:
-            print(f"⚠️  Screenshot {p}: {e}")
+            warn(f"Screenshot failed {p}: {e}")
 
 
 async def dump_html(page, filename: str):
     try:
-        Path(filename).write_text(await page.content(), encoding="utf-8")
-        print(f"   📄 {filename}")
+        content = await page.content()
+        Path(filename).write_text(content, encoding="utf-8")
+        info(f"HTML dumped: {filename} ({len(content)} chars)")
     except Exception as e:
-        print(f"   ⚠️  HTML dump: {e}")
+        warn(f"HTML dump failed: {e}")
+
+
+def is_picker_url(url: str) -> bool:
+    return any(x in url for x in ["device-based", "/caa/", "login/caa", "login/identifier"])
+
+def is_hard_login_url(url: str) -> bool:
+    return "/login" in url and not is_picker_url(url)
+
+def classify_url(url: str) -> str:
+    if "checkpoint" in url:        return "CHECKPOINT"
+    if is_hard_login_url(url):     return "LOGIN_WALL"
+    if is_picker_url(url):         return "DEVICE_PICKER"
+    if "reels/create" in url:      return "REELS_CREATE"
+    if "facebook.com" in url:      return "FACEBOOK_PAGE"
+    return "OTHER"
 
 
 async def force_tap(page, locator) -> bool:
@@ -257,243 +287,6 @@ async def force_tap(page, locator) -> bool:
     return False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Nuclear Continue-button clicker
-# ─────────────────────────────────────────────────────────────────────────────
-
-def is_picker_url(url: str) -> bool:
-    return any(x in url for x in ["device-based", "/caa/", "login/caa", "login/identifier"])
-
-def is_hard_login_url(url: str) -> bool:
-    return "/login" in url and not is_picker_url(url)
-
-
-async def nuke_continue_button(page, label: str) -> bool:
-    """Try every possible method to click the Continue button. Returns True if URL changed."""
-    print(f"   🔨 nuke_continue [{label}]")
-
-    SELECTORS = [
-        '[aria-label^="Continue"]', '[aria-label*="Continue"]',
-        'div[role="button"][aria-label^="Continue"]',
-        'a[role="button"][aria-label^="Continue"]', 'a[aria-label^="Continue"]',
-        'div[role="button"]:has-text("Continue")', 'a[role="button"]:has-text("Continue")',
-        'span:text-is("Continue")', 'span:has-text("Continue")',
-        'button:has-text("Continue")',
-        'div[role="button"]:first-of-type', 'a[role="button"]:first-of-type',
-    ]
-
-    # Wait up to 12 s for any selector to appear
-    for _ in range(12):
-        for sel in SELECTORS:
-            try:
-                if await page.locator(sel).count() > 0:
-                    print(f"      button found via: {sel}")
-                    break
-            except Exception:
-                pass
-        else:
-            await asyncio.sleep(1)
-            continue
-        break
-
-    url_before = page.url
-
-    # ── Phase 2: selector × method grid ──────────────────────────────────
-    for sel in SELECTORS:
-        try:
-            locs = page.locator(sel)
-            count = await locs.count()
-            if count == 0:
-                continue
-            indices = list(dict.fromkeys([0, count - 1] + list(range(min(count, 5)))))
-            for idx in indices:
-                loc = locs.nth(idx)
-                tag = f"sel={sel!r}[{idx}]"
-
-                # A – standard
-                try:
-                    await loc.scroll_into_view_if_needed(timeout=3_000)
-                    await loc.click(timeout=5_000)
-                    print(f"      ✅ A:click {tag}")
-                    await asyncio.sleep(5)
-                    if page.url != url_before:
-                        return True
-                except Exception as e:
-                    print(f"      — A {tag}: {e}")
-
-                # B – force
-                try:
-                    await loc.click(force=True, timeout=5_000)
-                    print(f"      ✅ B:force {tag}")
-                    await asyncio.sleep(5)
-                    if page.url != url_before:
-                        return True
-                except Exception as e:
-                    print(f"      — B {tag}: {e}")
-
-                # C – touchscreen
-                try:
-                    box = await loc.bounding_box()
-                    if box:
-                        cx = box["x"] + box["width"] / 2
-                        cy = box["y"] + box["height"] / 2
-                        await page.touchscreen.tap(cx, cy)
-                        print(f"      ✅ C:touch {tag} ({cx:.0f},{cy:.0f})")
-                        await asyncio.sleep(5)
-                        if page.url != url_before:
-                            return True
-                except Exception as e:
-                    print(f"      — C {tag}: {e}")
-
-                # D – mouse move + click
-                try:
-                    box = await loc.bounding_box()
-                    if box:
-                        cx = box["x"] + box["width"] / 2
-                        cy = box["y"] + box["height"] / 2
-                        await page.mouse.move(cx, cy)
-                        await asyncio.sleep(0.3)
-                        await page.mouse.click(cx, cy)
-                        print(f"      ✅ D:mouse {tag}")
-                        await asyncio.sleep(5)
-                        if page.url != url_before:
-                            return True
-                except Exception as e:
-                    print(f"      — D {tag}: {e}")
-
-                # E – JS .click()
-                try:
-                    await loc.evaluate("el => el.click()")
-                    print(f"      ✅ E:js {tag}")
-                    await asyncio.sleep(5)
-                    if page.url != url_before:
-                        return True
-                except Exception as e:
-                    print(f"      — E {tag}: {e}")
-
-                # F – full mouse event dispatch
-                try:
-                    await loc.evaluate("""el => {
-                        ['mouseover','mouseenter','mousemove','mousedown','mouseup','click']
-                        .forEach(t => el.dispatchEvent(
-                            new MouseEvent(t, {bubbles:true,cancelable:true,view:window})
-                        ));
-                    }""")
-                    print(f"      ✅ F:events {tag}")
-                    await asyncio.sleep(5)
-                    if page.url != url_before:
-                        return True
-                except Exception as e:
-                    print(f"      — F {tag}: {e}")
-
-                # G – focus + Enter
-                try:
-                    await loc.focus()
-                    await asyncio.sleep(0.2)
-                    await page.keyboard.press("Enter")
-                    print(f"      ✅ G:enter {tag}")
-                    await asyncio.sleep(5)
-                    if page.url != url_before:
-                        return True
-                except Exception as e:
-                    print(f"      — G {tag}: {e}")
-
-                # H – focus + Space
-                try:
-                    await loc.focus()
-                    await asyncio.sleep(0.2)
-                    await page.keyboard.press("Space")
-                    print(f"      ✅ H:space {tag}")
-                    await asyncio.sleep(5)
-                    if page.url != url_before:
-                        return True
-                except Exception as e:
-                    print(f"      — H {tag}: {e}")
-
-        except Exception as outer_e:
-            print(f"   — outer error {sel!r}: {outer_e}")
-
-    # ── Phase 3: coordinate brute-force ──────────────────────────────────
-    print("   🔨 Phase 3 — coordinate grid…")
-    vw = page.viewport_size or {"width": 1280, "height": 900}
-    w, h = vw["width"], vw["height"]
-    for xp in [0.60, 0.70, 0.75, 0.80]:
-        for yp in [0.40, 0.50, 0.55, 0.60]:
-            cx, cy = int(w * xp), int(h * yp)
-            try:
-                await page.mouse.click(cx, cy)
-                await asyncio.sleep(3)
-                if page.url != url_before:
-                    print(f"      ✅ coord ({cx},{cy}) worked")
-                    return True
-            except Exception:
-                pass
-
-    # ── Phase 4: Tab navigation ───────────────────────────────────────────
-    print("   🔨 Phase 4 — Tab navigation…")
-    await page.keyboard.press("Tab")
-    for i in range(20):
-        try:
-            tag = await page.evaluate(
-                "() => document.activeElement ? document.activeElement.outerHTML.slice(0,200) : ''"
-            )
-            if "continue" in tag.lower():
-                await page.keyboard.press("Enter")
-                await asyncio.sleep(4)
-                if page.url != url_before:
-                    print(f"      ✅ Tab#{i} + Enter")
-                    return True
-            await page.keyboard.press("Tab")
-            await asyncio.sleep(0.2)
-        except Exception:
-            pass
-
-    # ── Phase 5: JS full-DOM text search ─────────────────────────────────
-    print("   🔨 Phase 5 — JS DOM text search…")
-    try:
-        hit = await page.evaluate("""() => {
-            const candidates = Array.from(document.querySelectorAll(
-                'div[role="button"],a[role="button"],button,a,span[tabindex]'
-            ));
-            const btn = candidates.find(el => {
-                const txt = (el.textContent||el.innerText||el.getAttribute('aria-label')||'').trim();
-                return /^continue/i.test(txt) || /continue as/i.test(txt);
-            });
-            if (!btn) return null;
-            btn.scrollIntoView({behavior:'instant',block:'center'});
-            ['mousedown','mouseup','click'].forEach(t =>
-                btn.dispatchEvent(new MouseEvent(t,{bubbles:true,cancelable:true}))
-            );
-            btn.click();
-            return btn.outerHTML.slice(0,200);
-        }""")
-        if hit:
-            print(f"      ✅ JS text search clicked: {hit[:80]}")
-            await asyncio.sleep(5)
-            if page.url != url_before:
-                return True
-    except Exception as e:
-        print(f"      — JS text search: {e}")
-
-    # ── Phase 6: direct bypass navigation ────────────────────────────────
-    print("   🔨 Phase 6 — direct URL bypass…")
-    try:
-        await page.goto("https://www.facebook.com/?sk=h_chr",
-                        wait_until="domcontentloaded", timeout=30_000)
-        await asyncio.sleep(5)
-        if not is_picker_url(page.url) and not is_hard_login_url(page.url):
-            print(f"      ✅ Direct nav bypassed picker → {page.url}")
-            return True
-    except Exception as e:
-        print(f"      — direct nav: {e}")
-
-    return False
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Facebook login check
-# ─────────────────────────────────────────────────────────────────────────────
-
 FEED_SELECTORS = [
     '[aria-label="Home"]', '[data-pagelet="LeftRail"]', 'div[role="feed"]',
     '[aria-label="Create"]', 'span:has-text("What\'s on your mind?")',
@@ -501,44 +294,142 @@ FEED_SELECTORS = [
     'div[data-pagelet="FeedUnit_0"]', 'div[role="main"]',
 ]
 
-async def ensure_logged_in(page) -> bool:
-    """Handle picker / login wall. Returns True when feed confirmed."""
-    print("🔍 Checking login state…")
-    for outer in range(6):
-        url = page.url
-        print(f"   [attempt {outer+1}] URL: {url}")
 
-        if is_hard_login_url(url):
-            print("❌ Real login wall — cookies expired. Export fresh storage_state.json.")
-            await save_screenshot(page, "02_login_failed")
-            return False
+async def nuke_continue_button(page, label: str) -> bool:
+    info(f"Attempting to click Continue button [{label}]")
+    SELECTORS = [
+        '[aria-label^="Continue"]', '[aria-label*="Continue"]',
+        'div[role="button"][aria-label^="Continue"]',
+        'div[role="button"]:has-text("Continue")',
+        'span:text-is("Continue")', 'span:has-text("Continue")',
+        'button:has-text("Continue")',
+    ]
+    url_before = page.url
 
-        if "checkpoint" in url:
-            print("❌ Account checkpoint — manual action required")
-            await save_screenshot(page, "02_checkpoint")
-            return False
+    # Wait up to 10s for any button
+    found_sel = None
+    for _ in range(10):
+        for sel in SELECTORS:
+            try:
+                if await page.locator(sel).count() > 0:
+                    found_sel = sel
+                    break
+            except Exception:
+                pass
+        if found_sel:
+            break
+        await asyncio.sleep(1)
 
-        if is_picker_url(url):
-            await dump_html(page, f"02_picker_attempt{outer+1}.html")
-            ok = await nuke_continue_button(page, f"attempt={outer+1}")
-            await save_screenshot(page, f"02_after_continue_{outer+1}")
-            if not ok:
-                print(f"   ⚠️  All click methods failed attempt {outer+1}")
-                await asyncio.sleep(3)
-            continue  # re-evaluate URL
+    if not found_sel:
+        warn("No Continue button found in DOM after 10s")
+        # Try JS DOM search
+        try:
+            hit = await page.evaluate("""() => {
+                const candidates = Array.from(document.querySelectorAll(
+                    'div[role="button"],a[role="button"],button,a,span[tabindex]'
+                ));
+                const btn = candidates.find(el => {
+                    const txt = (el.textContent||el.innerText||el.getAttribute('aria-label')||'').trim();
+                    return /^continue/i.test(txt);
+                });
+                if (!btn) return null;
+                btn.click();
+                return btn.outerHTML.slice(0,200);
+            }""")
+            if hit:
+                ok(f"JS found & clicked Continue: {hit[:80]}")
+                await asyncio.sleep(5)
+                return page.url != url_before
+        except Exception as e:
+            warn(f"JS search failed: {e}")
 
-        # Check for feed elements
-        for sel in FEED_SELECTORS:
-            if await page.locator(sel).count() > 0:
-                print(f"   ✅ Logged in — confirmed: {sel}")
+        # Phase 6: direct bypass
+        info("Trying direct navigation bypass...")
+        try:
+            await page.goto("https://www.facebook.com/?sk=h_chr",
+                            wait_until="domcontentloaded", timeout=30_000)
+            await asyncio.sleep(5)
+            if not is_picker_url(page.url) and not is_hard_login_url(page.url):
+                ok(f"Direct nav bypassed picker → {page.url}")
                 return True
+        except Exception as e:
+            warn(f"Direct nav failed: {e}")
+        return False
 
-        print(f"   ⏳ Feed not ready (attempt {outer+1}) — waiting 4 s…")
+    info(f"Found Continue button via: {found_sel}")
+    loc = page.locator(found_sel).first
+    for method_name, method in [
+        ("standard click", lambda: loc.click(timeout=5_000)),
+        ("force click",    lambda: loc.click(force=True, timeout=5_000)),
+        ("JS click",       lambda: loc.evaluate("el => el.click()")),
+    ]:
+        try:
+            await method()
+            await asyncio.sleep(5)
+            if page.url != url_before:
+                ok(f"Continue clicked via {method_name} — URL changed")
+                return True
+            info(f"{method_name}: URL unchanged ({page.url})")
+        except Exception as e:
+            warn(f"{method_name} failed: {e}")
+
+    return False
+
+
+async def ensure_logged_in(page) -> bool:
+    step("Checking Facebook login state")
+    for attempt in range(6):
+        url = page.url
+        url_type = classify_url(url)
+        info(f"Attempt {attempt+1}/6 — URL: {url}")
+        info(f"URL type: {url_type}")
+
+        if url_type == "CHECKPOINT":
+            fail("Account checkpoint/restriction detected — manual action required")
+            fail("Check your Facebook account for security notices")
+            await save_screenshot(page, f"LOGIN_CHECKPOINT_{attempt+1}")
+            await dump_html(page, f"checkpoint_{attempt+1}.html")
+            return False
+
+        if url_type == "LOGIN_WALL":
+            fail("Hard login wall — session cookies are EXPIRED")
+            fail("You need to re-export storage_state.json from a fresh browser session")
+            await save_screenshot(page, f"LOGIN_WALL_{attempt+1}")
+            return False
+
+        if url_type == "DEVICE_PICKER":
+            info("Device picker detected — trying to bypass")
+            await dump_html(page, f"picker_{attempt+1}.html")
+            ok_click = await nuke_continue_button(page, f"attempt={attempt+1}")
+            await save_screenshot(page, f"after_continue_{attempt+1}")
+            if not ok_click:
+                warn(f"Could not click Continue on attempt {attempt+1}")
+                await asyncio.sleep(3)
+            continue
+
+        # Check for feed elements proving we're logged in
+        for sel in FEED_SELECTORS:
+            try:
+                count = await page.locator(sel).count()
+                if count > 0:
+                    ok(f"Logged in confirmed via: {sel}")
+                    return True
+            except Exception:
+                pass
+
+        # Check page title for clues
+        try:
+            title = await page.title()
+            info(f"Page title: {title}")
+        except Exception:
+            pass
+
+        info(f"Feed not ready yet — waiting 4s (attempt {attempt+1}/6)")
         await asyncio.sleep(4)
 
-    print("❌ Login check exhausted")
-    await dump_html(page, "02_login_failed.html")
-    await save_screenshot(page, "02_login_failed")
+    fail("Login check exhausted all 6 attempts")
+    await dump_html(page, "login_failed_final.html")
+    await save_screenshot(page, "LOGIN_FAILED_FINAL")
     return False
 
 
@@ -547,26 +438,39 @@ async def ensure_logged_in(page) -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def upload_reel(caption: str, video_path: str) -> bool:
-    """Run the full upload. Returns True on confirmed publish."""
+    step("Starting Facebook Reel upload")
     if not Path(video_path).exists():
-        print(f"❌ Video not found: {video_path}")
+        fail(f"Video file not found: {video_path}")
         return False
 
     size_mb = Path(video_path).stat().st_size // (1024 * 1024)
-    print(f"🎬 Video   : {video_path}  ({size_mb} MB)")
-    print(f"📝 Caption : {caption[:80]}")
+    ok(f"Video: {video_path}  ({size_mb} MB)")
+    info(f"Caption: {caption[:120]}")
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox", "--disable-setuid-sandbox",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-infobars", "--disable-dev-shm-usage",
-            ]
-        )
+        step("Launching Chromium browser")
+        try:
+            browser = await p.chromium.launch(
+                headless=True,
+                timeout=30_000,
+                args=[
+                    "--no-sandbox", "--disable-setuid-sandbox",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-infobars", "--disable-dev-shm-usage",
+                    "--single-process", "--no-zygote",
+                ]
+            )
+            ok("Browser launched")
+        except Exception as e:
+            fail(f"Browser launch FAILED: {e}")
+            return False
 
         storage_state_json = resolve_fb_storage_state()
+        if not storage_state_json:
+            fail("No Facebook session available — aborting")
+            await browser.close()
+            return False
+
         context_kwargs = dict(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -577,40 +481,35 @@ async def upload_reel(caption: str, video_path: str) -> bool:
             locale="en-US",
             timezone_id="Asia/Karachi",
             accept_downloads=True,
-            permissions=["clipboard-read", "clipboard-write"],
         )
 
-        using_storage = False
-        if storage_state_json:
-            try:
-                state = json.loads(storage_state_json)
-                context_kwargs["storage_state"] = state
-                using_storage = True
-                print(f"✅ storage_state: {len(state.get('cookies',[]))} cookies, "
-                      f"{len(state.get('origins',[]))} origin(s)")
-            except json.JSONDecodeError:
-                print("⚠️  storage_state invalid — trying legacy cookies")
-
-        context = await browser.new_context(**context_kwargs)
-        published = False
-
+        step("Creating browser context with session cookies")
         try:
-            if not using_storage:
-                if not Path(COOKIES_TXT).exists():
-                    print(f"❌ No session source found")
-                    return False
-                await context.add_cookies(load_netscape_cookies(COOKIES_TXT))
+            state = json.loads(storage_state_json)
+            context_kwargs["storage_state"] = state
+            context = await browser.new_context(**context_kwargs)
+            ok(f"Context created with {len(state.get('cookies', []))} cookies")
+        except Exception as e:
+            fail(f"Context creation failed: {e}")
+            await browser.close()
+            return False
 
+        published = False
+        try:
             published = await _run_upload_flow(context, caption, video_path)
-
+        except Exception as e:
+            fail(f"Upload flow crashed with exception: {e}")
+            import traceback
+            print(traceback.format_exc())
         finally:
             try:
                 fresh = await context.storage_state()
                 Path(STORAGE_STATE).write_text(json.dumps(fresh), encoding="utf-8")
-                print(f"\n💾 Refreshed storage_state saved ({len(fresh.get('cookies',[]))} cookies)")
+                ok(f"Saved refreshed storage_state ({len(fresh.get('cookies', []))} cookies)")
             except Exception as e:
-                print(f"⚠️  Could not save storage_state: {e}")
+                warn(f"Could not save storage_state: {e}")
             await browser.close()
+            ok("Browser closed")
 
     return published
 
@@ -620,448 +519,495 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
     published = False
 
     # ── Step 1: Load Facebook ─────────────────────────────────────────────
-    print("\n🌐 Opening Facebook…")
+    step("Loading Facebook homepage")
     try:
-        await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=60_000)
+        response = await page.goto("https://www.facebook.com/",
+                                   wait_until="domcontentloaded", timeout=60_000)
+        info(f"HTTP status: {response.status if response else 'unknown'}")
     except Exception as e:
-        print(f"❌ Load failed: {e}")
-        await save_screenshot(page, "00_load_failed")
+        fail(f"Page load failed: {e}")
+        await save_screenshot(page, "FAIL_01_load")
         return False
+    
     await asyncio.sleep(8)
+    info(f"Current URL after load: {page.url}")
+    info(f"URL type: {classify_url(page.url)}")
     await save_screenshot(page, "01_after_load")
-    print(f"   URL: {page.url}")
 
     # ── Step 2: Login check ───────────────────────────────────────────────
     if not await ensure_logged_in(page):
+        fail("ABORT: Could not confirm login")
         return False
     await save_screenshot(page, "02_logged_in")
+    ok("Login confirmed — proceeding to upload")
 
     # ── Step 3: Navigate to Reels create ─────────────────────────────────
-    print("\n🎬 Navigating to Reels create page…")
+    step("Navigating to Reels create page")
     try:
-        await page.goto("https://www.facebook.com/reels/create/",
-                        wait_until="domcontentloaded", timeout=60_000)
+        response = await page.goto("https://www.facebook.com/reels/create/",
+                                   wait_until="domcontentloaded", timeout=60_000)
+        info(f"HTTP status: {response.status if response else 'unknown'}")
     except Exception as e:
-        print(f"❌ Nav failed: {e}")
-        await save_screenshot(page, "03_nav_failed")
+        fail(f"Navigation to reels/create failed: {e}")
+        await save_screenshot(page, "FAIL_03_nav")
         return False
+    
     await asyncio.sleep(8)
-    await save_screenshot(page, "03_reels_create_page")
-    print(f"   URL: {page.url}")
+    info(f"Current URL: {page.url}")
+    info(f"URL type: {classify_url(page.url)}")
+    await save_screenshot(page, "03_reels_create")
+    await dump_html(page, "03_reels_create.html")
+
+    # Check if we got redirected away from reels create
+    if "reels/create" not in page.url:
+        warn(f"Got redirected away from reels/create to: {page.url}")
+        warn(f"This may mean the account lacks Reels access or got a security redirect")
 
     # ── Step 4: Attach video ──────────────────────────────────────────────
-    print("\n📁 Attaching video…")
+    step("Attaching video file")
     uploaded = False
 
+    # Try direct file input first
     for sel in ['input[type="file"][accept*="video"]', 'input[type="file"]']:
         try:
-            inp = page.locator(sel).first
-            if await inp.count() > 0:
-                await inp.set_input_files(video_path)
-                print(f"   ✅ Direct file input: {sel}")
+            inp = page.locator(sel)
+            count = await inp.count()
+            info(f"File input selector '{sel}': {count} found")
+            if count > 0:
+                await inp.first.set_input_files(video_path)
+                ok(f"Video attached via direct input: {sel}")
                 uploaded = True
                 break
         except Exception as e:
-            print(f"   — direct input {sel}: {e}")
+            warn(f"Direct input {sel} failed: {e}")
 
     if not uploaded:
-        for sel in [
-            'div[role="button"]:has-text("Select video")',
-            'div[role="button"]:has-text("Upload")',
-            'div[role="button"]:has-text("Add video")',
-            'span:has-text("Select video")', 'span:has-text("Select Video")',
-            '[aria-label="Select video"]', 'div[aria-label="Add to reel"]',
-            'div:has-text("Select video from computer")',
-        ]:
+        info("Direct input failed — trying upload button click")
+        button_selectors = [
+            ('Select video', 'div[role="button"]:has-text("Select video")'),
+            ('Upload',       'div[role="button"]:has-text("Upload")'),
+            ('Add video',    'div[role="button"]:has-text("Add video")'),
+            ('Select Video span', 'span:has-text("Select video")'),
+            ('aria-label Select video', '[aria-label="Select video"]'),
+            ('Add to reel', 'div[aria-label="Add to reel"]'),
+            ('from computer', 'div:has-text("Select video from computer")'),
+        ]
+        for btn_name, sel in button_selectors:
             el = page.locator(sel).first
-            if await el.count() > 0:
-                print(f"   🎯 Upload button: {sel}")
-                try:
-                    async with page.expect_file_chooser(timeout=15_000) as fc_info:
-                        await el.click(force=True)
-                    fc = await fc_info.value
-                    await fc.set_files(video_path)
-                    print("   ✅ File chooser upload")
-                    uploaded = True
-                    break
-                except Exception as e:
-                    print(f"   — file chooser {sel}: {e}")
+            try:
+                count = await el.count()
+                info(f"Upload button '{btn_name}': {count} found")
+                if count == 0:
+                    continue
+                async with page.expect_file_chooser(timeout=10_000) as fc_info:
+                    await el.click(force=True)
+                fc = await fc_info.value
+                await fc.set_files(video_path)
+                ok(f"File chooser upload via: {btn_name}")
+                uploaded = True
+                break
+            except Exception as e:
+                warn(f"Button '{btn_name}' failed: {e}")
 
     await save_screenshot(page, "04_after_upload_attempt")
-    await dump_html(page, "04_page_state.html")
+    await dump_html(page, "04_after_upload.html")
+
     if not uploaded:
-        print("❌ Could not attach video")
+        fail("ABORT: Could not attach video — no file input or upload button found")
+        fail("Check 04_after_upload.html to see what the page looks like")
         return False
+    ok("Video attached successfully")
+
+    # Wait for video to process (up to 3 minutes)
+    step("Waiting for video to process")
+    info("Watching for Next button to become active (up to 3 min)...")
+    
+    next_selectors = [
+        'div[aria-label="Next"][role="button"]',
+        'div[role="button"]:has-text("Next")',
+        'span:has-text("Next")',
+        'button:has-text("Next")',
+    ]
+    
+    next_ready = False
+    for elapsed in range(0, 180, 5):
+        for sel in next_selectors:
+            try:
+                btn = page.locator(sel).first
+                if await btn.count() > 0:
+                    disabled = await btn.get_attribute("aria-disabled")
+                    info(f"[{elapsed}s] Next button found via '{sel}', aria-disabled={disabled}")
+                    if disabled != "true":
+                        ok(f"Next button is active after {elapsed}s!")
+                        next_ready = True
+                        break
+            except Exception:
+                pass
+        if next_ready:
+            break
+        if elapsed % 15 == 0:
+            await save_screenshot(page, f"04_processing_{elapsed}s")
+        await asyncio.sleep(5)
+    
+    if not next_ready:
+        warn("Next button never became active after 3 minutes")
+        warn("Video may still be processing or upload failed silently")
+        await save_screenshot(page, "04_processing_timeout")
+        await dump_html(page, "04_processing_timeout.html")
 
     # ── Step 5: Click Next ────────────────────────────────────────────────
-    print("\n➡️  Clicking Next…")
-    for sel in [
-        'div[aria-label="Next"][role="button"]', 'div[role="button"]:has-text("Next")',
-        'span:has-text("Next")', 'button:has-text("Next")',
-    ]:
+    step("Clicking Next button")
+    clicked_next = False
+    for sel in next_selectors:
         try:
             btn = page.locator(sel).first
             if await btn.count() == 0:
                 continue
-            await btn.wait_for(state="visible", timeout=15_000)
-            if await btn.get_attribute("aria-disabled") == "true":
+            disabled = await btn.get_attribute("aria-disabled")
+            if disabled == "true":
+                info(f"Skipping '{sel}' — still disabled")
                 continue
-            if await force_tap(page, btn):
-                print(f"   ✅ Next via: {sel}")
-                break
+            await btn.scroll_into_view_if_needed(timeout=5_000)
+            await btn.click(timeout=10_000)
+            ok(f"Next clicked via: {sel}")
+            clicked_next = True
+            break
         except Exception as e:
-            print(f"   — Next {sel}: {e}")
+            warn(f"Next click '{sel}' failed: {e}")
+
+    if not clicked_next:
+        fail("Could not click Next")
+        await save_screenshot(page, "FAIL_05_next")
+        return False
 
     await asyncio.sleep(3)
-    await save_screenshot(page, "05a_after_first_next")
+    await save_screenshot(page, "05_after_next")
 
     # ── Step 5b: Wait for caption field ──────────────────────────────────
-    print("\n⏳ Waiting for caption field…")
-    caption_selectors_wait = [
+    step("Waiting for caption/description field")
+    caption_wait_selectors = [
         'div[contenteditable="true"][aria-placeholder="Describe your reel..."]',
-        'div[contenteditable="true"][aria-placeholder*="Describe your reel" i]',
+        'div[contenteditable="true"][aria-placeholder*="Describe" i]',
+        'div[contenteditable="true"][aria-placeholder*="reel" i]',
+        'div[data-lexical-editor="true"][contenteditable="true"]',
+        'div[role="textbox"][contenteditable="true"]',
+        'div[contenteditable="true"]',
     ]
+    
+    caption_field_found = False
     for elapsed in range(0, 60, 2):
-        if any([await page.locator(s).count() > 0 for s in caption_selectors_wait]):
-            print(f"   ✅ Caption field ready after {elapsed}s")
+        for sel in caption_wait_selectors:
+            try:
+                count = await page.locator(sel).count()
+                if count > 0:
+                    ok(f"Caption field appeared after {elapsed}s via: {sel}")
+                    caption_field_found = True
+                    break
+            except Exception:
+                pass
+        if caption_field_found:
             break
-        print(f"   …{elapsed}s")
+        if elapsed % 10 == 0:
+            info(f"Waiting for caption field... {elapsed}s elapsed")
+            await save_screenshot(page, f"05_waiting_caption_{elapsed}s")
         await asyncio.sleep(2)
 
-    await save_screenshot(page, "05_after_processing")
+    if not caption_field_found:
+        warn("Caption field never appeared — page structure may have changed")
+        await dump_html(page, "05_no_caption_field.html")
+
+    await save_screenshot(page, "05_caption_ready")
 
     # ── Step 6: Enter caption ─────────────────────────────────────────────
-    print("\n✍️  Entering caption…")
-
-    caption_selectors = [
-        ("aria-placeholder exact",  'div[contenteditable="true"][aria-placeholder="Describe your reel..."]'),
-        ("aria-placeholder loose",  'div[contenteditable="true"][aria-placeholder*="Describe your reel" i]'),
-        ("aria-placeholder reel",   'div[contenteditable="true"][aria-placeholder*="reel" i]'),
-        ("lexical editor",          'div[data-lexical-editor="true"][contenteditable="true"]'),
-        ("role textbox",            'div[role="textbox"][contenteditable="true"]'),
-        ("aria-label description",  'div[aria-label*="description" i][contenteditable="true"]'),
-        ("aria-label caption",      'div[aria-label*="caption" i][contenteditable="true"]'),
-        ("textarea description",    'textarea[placeholder*="description" i]'),
-        ("textarea caption",        'textarea[placeholder*="caption" i]'),
-        ("any contenteditable",     'div[contenteditable="true"]'),
-    ]
-
-    async def verify_text(loc) -> bool:
-        try:
-            txt = await loc.evaluate("el => (el.innerText||el.textContent||el.value||'').trim()")
-            return len(txt) > 0
-        except Exception:
-            return False
-
-    async def try_type(field) -> bool:
-        await field.scroll_into_view_if_needed(timeout=5_000)
-        await field.click(timeout=5_000); await asyncio.sleep(0.4)
-        await field.click(timeout=5_000); await asyncio.sleep(0.3)
-        await page.keyboard.type(caption, delay=40); await asyncio.sleep(0.5)
-        return await verify_text(field)
-
-    async def try_seq(field) -> bool:
-        await field.click(timeout=5_000); await asyncio.sleep(0.3)
-        await field.press_sequentially(caption, delay=30); await asyncio.sleep(0.5)
-        return await verify_text(field)
-
-    async def try_js_type(field) -> bool:
-        await field.evaluate("el => el.focus()"); await asyncio.sleep(0.3)
-        await page.keyboard.type(caption, delay=40); await asyncio.sleep(0.5)
-        return await verify_text(field)
-
-    async def try_execcmd(field) -> bool:
-        await field.click(timeout=5_000); await asyncio.sleep(0.3)
-        await field.evaluate("""(el, t) => {
-            el.focus();
-            const s = window.getSelection(); s.removeAllRanges();
-            const r = document.createRange(); r.selectNodeContents(el); s.addRange(r);
-            document.execCommand('insertText', false, t);
-        }""", caption); await asyncio.sleep(0.5)
-        return await verify_text(field)
-
-    async def try_dom(field) -> bool:
-        await field.evaluate("""(el, t) => {
-            el.focus(); el.textContent = t;
-            ['beforeinput','input','change'].forEach(ev =>
-                el.dispatchEvent(new InputEvent(ev, {bubbles:true,cancelable:true,data:t}))
-            );
-        }""", caption); await asyncio.sleep(0.5)
-        return await verify_text(field)
-
-    async def try_paste(field) -> bool:
-        await field.click(timeout=5_000); await asyncio.sleep(0.3)
-        await field.evaluate("""(el, t) => {
-            el.focus();
-            const dt = new DataTransfer(); dt.setData('text/plain', t);
-            el.dispatchEvent(new ClipboardEvent('paste',{bubbles:true,cancelable:true,clipboardData:dt}));
-        }""", caption); await asyncio.sleep(0.5)
-        return await verify_text(field)
-
-    async def try_clipboard(field) -> bool:
-        await field.click(timeout=5_000); await asyncio.sleep(0.3)
-        try:
-            await page.evaluate("t => navigator.clipboard.writeText(t)", caption)
-        except Exception as e:
-            print(f"         clipboard.writeText blocked: {e}"); return False
-        await page.keyboard.press("Control+V"); await asyncio.sleep(0.5)
-        return await verify_text(field)
-
-    caption_methods = [
-        ("keyboard.type",         try_type),
-        ("press_sequentially",    try_seq),
-        ("js-focus+keyboard",     try_js_type),
-        ("execCommand",           try_execcmd),
-        ("DOM injection",         try_dom),
-        ("synthetic paste",       try_paste),
-        ("clipboard Ctrl+V",      try_clipboard),
-    ]
+    step("Entering caption text")
+    info(f"Caption to type ({len(caption)} chars): {caption[:80]}")
 
     caption_ok = False
-    for sel_name, sel in caption_selectors:
+    for sel_name, sel in [
+        ("aria-placeholder exact",  'div[contenteditable="true"][aria-placeholder="Describe your reel..."]'),
+        ("aria-placeholder loose",  'div[contenteditable="true"][aria-placeholder*="Describe" i]'),
+        ("lexical editor",          'div[data-lexical-editor="true"][contenteditable="true"]'),
+        ("role textbox",            'div[role="textbox"][contenteditable="true"]'),
+        ("any contenteditable",     'div[contenteditable="true"]'),
+    ]:
         if caption_ok:
             break
-        field = page.locator(sel).first
-        if await field.count() == 0:
-            continue
         try:
-            await field.wait_for(state="visible", timeout=5_000)
-        except Exception:
-            continue
-        print(f"   🎯 {sel_name}")
-        for m_name, m_fn in caption_methods:
-            try:
-                await field.evaluate("el => { el.textContent=''; el.innerText=''; }")
-                await asyncio.sleep(0.2)
-                if await m_fn(field):
-                    print(f"      ✅ {m_name}")
+            field = page.locator(sel).first
+            if await field.count() == 0:
+                info(f"  Selector '{sel_name}': not found")
+                continue
+            info(f"  Trying selector: {sel_name}")
+            
+            # Clear existing content
+            await field.evaluate("el => { el.textContent=''; }")
+            await asyncio.sleep(0.2)
+            
+            # Try typing
+            await field.click(timeout=5_000)
+            await asyncio.sleep(0.3)
+            await page.keyboard.type(caption, delay=30)
+            await asyncio.sleep(0.5)
+            
+            # Verify
+            txt = await field.evaluate("el => (el.innerText||el.textContent||'').trim()")
+            if txt:
+                ok(f"Caption entered via '{sel_name}' ({len(txt)} chars)")
+                caption_ok = True
+            else:
+                warn(f"  '{sel_name}': typed but field is empty — trying execCommand")
+                await field.click(timeout=5_000)
+                await field.evaluate("(el, t) => { el.focus(); document.execCommand('selectAll'); document.execCommand('insertText', false, t); }", caption)
+                await asyncio.sleep(0.5)
+                txt = await field.evaluate("el => (el.innerText||el.textContent||'').trim()")
+                if txt:
+                    ok(f"Caption entered via execCommand ({len(txt)} chars)")
                     caption_ok = True
-                    break
-                else:
-                    print(f"      — {m_name}: empty")
-            except Exception as e:
-                print(f"      — {m_name}: {e}")
+        except Exception as e:
+            warn(f"  Caption selector '{sel_name}' error: {e}")
 
     if not caption_ok:
-        print("⚠️  Caption failed — continuing anyway")
-        await dump_html(page, "06_caption_failed.html")
+        warn("Caption could not be entered — continuing anyway (post may have no caption)")
     await save_screenshot(page, "06_after_caption")
 
-    # ── Step 7: Next → Post ───────────────────────────────────────────────
-    print("\n📤 Clicking Next then Post…")
-    for sel in [
-        'div[aria-label="Next"][role="button"]', 'div[role="button"]:has-text("Next")',
-        'span:has-text("Next")', 'button:has-text("Next")',
-    ]:
+    # ── Step 7: Click Next again → then Post ─────────────────────────────
+    step("Clicking Next (2nd time) to reach Post panel")
+    clicked_next2 = False
+    for sel in next_selectors:
         try:
             btn = page.locator(sel).last
-            if await btn.count() == 0: continue
-            await btn.wait_for(state="visible", timeout=8_000)
-            if await btn.get_attribute("aria-disabled") == "true": continue
-            if await force_tap(page, btn):
-                print(f"   ✅ Next via: {sel}")
-                await asyncio.sleep(3)
-                await save_screenshot(page, "07_after_next")
-                break
+            if await btn.count() == 0:
+                continue
+            disabled = await btn.get_attribute("aria-disabled")
+            if disabled == "true":
+                continue
+            await btn.click(force=True)
+            ok(f"Second Next clicked via: {sel}")
+            clicked_next2 = True
+            await asyncio.sleep(4)
+            break
         except Exception as e:
-            print(f"   — Next {sel}: {e}")
+            warn(f"Second Next '{sel}' failed: {e}")
 
-    async def panel_open() -> bool:
-        try:
-            return (await page.locator('div[aria-label="Post"][role="button"]').count() > 0
-                    or await page.locator('text="Reel settings"').count() > 0)
-        except Exception:
-            return False
+    if not clicked_next2:
+        warn("Could not click second Next — may already be on Post panel")
+    
+    await save_screenshot(page, "07_before_post")
+    await dump_html(page, "07_before_post.html")
 
+    # ── Step 8: Click Post/Publish ─────────────────────────────────────
+    step("Clicking Post / Publish button")
     post_selectors = [
         ("aria-label Post",    'div[aria-label="Post"][role="button"]'),
         ("text Post exact",    'div[role="button"]:text-is("Post")'),
         ("span Post",          'span:text-is("Post")'),
-        ("submit",             'button[type="submit"]'),
         ("aria-label Publish", 'div[aria-label="Publish"][role="button"]'),
         ("aria-label Share",   'div[aria-label="Share now"][role="button"]'),
         ("text Post",          'div[role="button"]:has-text("Post")'),
         ("text Publish",       'div[role="button"]:has-text("Publish")'),
         ("text Share now",     'div[role="button"]:has-text("Share now")'),
+        ("submit button",      'button[type="submit"]'),
     ]
 
     post_clicked = False
     for sel_name, sel in post_selectors:
-        if post_clicked: break
-        btn = page.locator(sel).last
-        if await btn.count() == 0: continue
         try:
-            await btn.wait_for(state="visible", timeout=5_000)
-        except Exception:
-            continue
-        if await btn.get_attribute("aria-disabled") == "true": continue
-        print(f"   🎯 Post candidate: {sel_name}")
-        for m_name, m_fn in [
-            ("force_tap",    lambda b: force_tap(page, b)),
-            ("dispatch",     lambda b: b.evaluate("""el => {
-                ['mousedown','mouseup','click'].forEach(t =>
-                    el.dispatchEvent(new MouseEvent(t,{bubbles:true,cancelable:true})));
-            }""")),
-            ("focus+Enter",  lambda b: (b.focus(), asyncio.sleep(0.2), page.keyboard.press("Enter"))),
-        ]:
-            try:
-                was_open = await panel_open()
-                await m_fn(btn)
-                await asyncio.sleep(2)
-                if was_open and not await panel_open():
-                    print(f"      ✅ {m_name} — panel closed")
-                    post_clicked = True
-                    break
-                print(f"      — {m_name}: panel still open")
-            except Exception as e:
-                print(f"      — {m_name}: {e}")
+            btn = page.locator(sel).last
+            count = await btn.count()
+            info(f"Post button '{sel_name}': {count} found")
+            if count == 0:
+                continue
+            disabled = await btn.get_attribute("aria-disabled")
+            if disabled == "true":
+                warn(f"  '{sel_name}' is disabled — skipping")
+                continue
+            
+            await btn.scroll_into_view_if_needed(timeout=5_000)
+            await btn.click(force=True)
+            ok(f"Post button clicked via: {sel_name}")
+            post_clicked = True
+            await asyncio.sleep(5)
+            break
+        except Exception as e:
+            warn(f"Post '{sel_name}' failed: {e}")
 
     if not post_clicked:
-        print("⚠️  Could not confirm Post click")
-        await dump_html(page, "07_post_failed.html")
-    await save_screenshot(page, "07_after_post")
+        fail("Could not click any Post/Publish button")
+        fail("Check 07_before_post.html to see available buttons")
+        await save_screenshot(page, "FAIL_08_no_post_button")
+        return False
 
-    # ── Step 8: Confirm publish ───────────────────────────────────────────
-    print("\n⏳ Waiting 30 s for publish confirmation…")
-    await asyncio.sleep(30)
-    await save_screenshot(page, "08_final_result")
-    await dump_html(page, "08_final_page.html")
-
+    # ── Step 9: Wait for confirmation ─────────────────────────────────────
+    step("Waiting for publish confirmation (up to 60s)")
     confirm_selectors = [
         'span:has-text("Your reel is now shared")',
         'span:has-text("Reel posted")',
         'span:has-text("Published")',
         'span:has-text("Your reel")',
         'div:has-text("Your reel was shared")',
+        'span:has-text("shared")',
     ]
-    for sel in confirm_selectors:
-        if await page.locator(sel).count() > 0:
-            print(f"🎉 PUBLISHED! (confirmed: {sel})")
-            published = True
+    
+    for elapsed in range(0, 60, 5):
+        for sel in confirm_selectors:
+            try:
+                if await page.locator(sel).count() > 0:
+                    ok(f"🎉 PUBLISHED! Confirmed via: {sel} (after {elapsed}s)")
+                    published = True
+                    break
+            except Exception:
+                pass
+        if published:
             break
-    else:
-        # Absence of the settings panel + absence of login page = likely published
-        if post_clicked and not await panel_open():
-            print("🎉 PUBLISHED (inferred — panel closed, no error detected)")
-            published = True
-        else:
-            print("⚠️  Could not confirm — check 08_final_result.png")
+        info(f"Waiting for confirmation... {elapsed}s")
+        if elapsed % 15 == 0:
+            await save_screenshot(page, f"09_waiting_confirm_{elapsed}s")
+        await asyncio.sleep(5)
+
+    if not published:
+        # Infer from page state
+        info("No explicit confirmation found — checking page state...")
+        try:
+            url_after = page.url
+            title_after = await page.title()
+            info(f"Final URL: {url_after}")
+            info(f"Final title: {title_after}")
+        except Exception:
+            pass
+        
+        # If Post panel is gone and we're not on an error page, assume success
+        try:
+            post_panel_gone = await page.locator('div[aria-label="Post"][role="button"]').count() == 0
+            info(f"Post panel gone: {post_panel_gone}")
+            if post_panel_gone and post_clicked:
+                ok("🎉 PUBLISHED (inferred — Post panel gone, no errors detected)")
+                published = True
+        except Exception:
+            pass
+
+    await save_screenshot(page, "09_final_result")
+    await dump_html(page, "09_final_result.html")
+
+    if not published:
+        warn("Could not confirm publish — check 09_final_result.png")
+        warn("The reel may have posted anyway; check your Facebook profile")
 
     return published
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Orchestrator: Drive → upload → move
+# Orchestrator
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_once():
-    """Download one video from Drive, upload to FB, move on success."""
+    global _step
+    _step = 0
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"\n{'='*60}")
-    print(f"🚀 Run started at {ts}")
+    print(f"  🚀 Run started at {ts}")
+    print(f"  Python: {sys.version}")
+    print(f"  PID: {os.getpid()}")
     print(f"{'='*60}")
+
+    # Print all relevant env vars (masked)
+    step("Checking environment variables")
+    for var in [UPLOAD_FOLDER_ENV, UPLOADED_FOLDER_ENV, "LOOP_INTERVAL_MINUTES", "CAPTIONS_FILE_ID"]:
+        val = os.environ.get(var, "")
+        info(f"{var}: {'SET (' + val + ')' if val else 'NOT SET'}")
+    for secret in [FB_STORAGE_STATE_ENV, GDRIVE_CREDS_ENV]:
+        val = os.environ.get(secret, "")
+        info(f"{secret}: {'SET (' + str(len(val)) + ' chars)' if val else 'NOT SET'}")
 
     upload_folder   = os.environ.get(UPLOAD_FOLDER_ENV)
     uploaded_folder = os.environ.get(UPLOADED_FOLDER_ENV)
 
     if not upload_folder:
-        print(f"❌ Env var {UPLOAD_FOLDER_ENV} not set")
+        fail(f"{UPLOAD_FOLDER_ENV} is not set — cannot continue")
         return
     if not uploaded_folder:
-        print(f"❌ Env var {UPLOADED_FOLDER_ENV} not set")
+        fail(f"{UPLOADED_FOLDER_ENV} is not set — cannot continue")
         return
 
-    # ── Build Drive service ───────────────────────────────────────────────
+    # Build Drive service
     try:
         service = build_drive_service()
     except Exception as e:
-        print(f"❌ Drive auth failed: {e}")
+        fail(f"Drive service failed: {e}")
         return
 
-    # ── Get caption ───────────────────────────────────────────────────────
+    # Get caption
     caption = gdrive_get_caption(service)
     if not caption:
         cap_path = Path(CAPTIONS_TXT)
         if cap_path.exists():
             caption = cap_path.read_text(encoding="utf-8").strip()
-            print(f"📝 Caption from local {CAPTIONS_TXT}")
+            info(f"Using local captions.txt: {caption[:80]}")
         else:
             caption = "Check out my latest reel! #reels #viral"
-            print("📝 Using default caption")
+            info(f"Using default caption: {caption}")
 
-    # ── List videos in upload folder ──────────────────────────────────────
+    # List videos
     try:
         videos = gdrive_list_videos(service, upload_folder)
     except Exception as e:
-        print(f"❌ Could not list Drive folder: {e}")
+        fail(f"Could not list Drive folder: {e}")
         return
 
     if not videos:
-        print("ℹ️  No videos in upload folder — nothing to do")
+        info("No videos in upload folder — nothing to do this run")
         return
 
-    # Pick the oldest video
     video_meta = videos[0]
-    file_id   = video_meta["id"]
-    file_name = video_meta["name"]
-    print(f"\n🎯 Picked: {file_name}  (id={file_id})")
+    file_id    = video_meta["id"]
+    file_name  = video_meta["name"]
+    ok(f"Selected video: {file_name} (id={file_id})")
 
-    # ── Download to temp dir ──────────────────────────────────────────────
     with tempfile.TemporaryDirectory() as tmp:
         try:
             local_path = gdrive_download_video(service, file_id, file_name, tmp)
         except Exception as e:
-            print(f"❌ Download failed: {e}")
+            fail(f"Download failed: {e}")
             return
 
-        # ── Upload to Facebook ────────────────────────────────────────────
         try:
             published = asyncio.run(upload_reel(caption=caption, video_path=local_path))
         except Exception as e:
-            print(f"❌ Upload exception: {e}")
+            fail(f"Upload exception: {e}")
+            import traceback
+            print(traceback.format_exc())
             published = False
 
-    # ── Move to fbuploaded on success ─────────────────────────────────────
     if published:
         try:
-            gdrive_move_to_uploaded(service, file_id, file_name,
-                                    upload_folder, uploaded_folder)
+            gdrive_move_to_uploaded(service, file_id, file_name, upload_folder, uploaded_folder)
         except Exception as e:
-            print(f"⚠️  Move to fbuploaded failed: {e}")
+            warn(f"Move to uploaded folder failed: {e}")
     else:
-        print(f"⚠️  Upload not confirmed — file stays in upload folder for retry")
+        warn("Upload not confirmed — file stays in upload folder for retry")
 
-    print(f"\n✅ Run complete. Published={published}")
+    print(f"\n{'='*60}")
+    print(f"  Run complete. Published={published}")
+    print(f"{'='*60}\n")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Scheduler — posts every LOOP_INTERVAL_MINUTES, runs forever
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_scheduled():
     if not HAS_SCHEDULE:
-        print("❌ 'schedule' package not installed. Run: pip install schedule")
+        fail("'schedule' package not installed. Run: pip install schedule")
         sys.exit(1)
-
     print(f"⏰ Scheduler started — posting every {LOOP_INTERVAL_MINUTES} minute(s)")
-    print(f"   Override interval via LOOP_INTERVAL_MINUTES env var (currently: {LOOP_INTERVAL_MINUTES})")
-    print("   Run with --once to execute immediately without scheduling\n")
-
-    # Run immediately on start, then on the fixed interval
     run_once()
     schedule.every(LOOP_INTERVAL_MINUTES).minutes.do(run_once)
-
     iteration = 0
     while True:
         schedule.run_pending()
-        time.sleep(30)           # check every 30 s
+        time.sleep(30)
         iteration += 1
-        if iteration % 20 == 0:  # heartbeat every ~10 min
+        if iteration % 20 == 0:
             next_run = schedule.next_run()
-            print(f"⏳ Scheduler alive — next run at {next_run.strftime('%H:%M:%S') if next_run else 'unknown'}")
+            print(f"⏳ Alive — next run at {next_run.strftime('%H:%M:%S') if next_run else 'unknown'}")
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     if "--once" in sys.argv or os.environ.get("RUN_ONCE"):
