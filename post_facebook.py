@@ -4,14 +4,12 @@ import os
 from pathlib import Path
 from playwright.async_api import async_playwright
 
-COOKIES_TXT      = "facebook_cookies.txt"      # legacy fallback only
-STORAGE_STATE    = "storage_state.json"        # preferred — cookies + localStorage
-CAPTIONS_TXT     = "captions.txt"
-VIDEO_FILE       = "testing.mp4"
-SCREENSHOTS_DIR  = Path("screenshots")
+COOKIES_TXT   = "facebook_cookies.txt"
+STORAGE_STATE = "storage_state.json"
+CAPTIONS_TXT  = "captions.txt"
+VIDEO_FILE    = "testing.mp4"
+SCREENSHOTS_DIR = Path("screenshots")
 
-# In CI, the full storage_state JSON is passed via this env var (GitHub secret)
-# rather than committed to the repo. Falls back to a local file for local runs.
 STORAGE_STATE_ENV_VAR = "FB_STORAGE_STATE"
 
 
@@ -20,15 +18,10 @@ STORAGE_STATE_ENV_VAR = "FB_STORAGE_STATE"
 # ─────────────────────────────────────────────────────────────────────────────
 
 def resolve_storage_state_path() -> str | None:
-    """
-    Returns the raw storage_state JSON text, preferring the GitHub Actions
-    secret (env var) over a local file, so CI never depends on a committed
-    session file. Returns None if neither source is available.
-    """
     env_val = os.environ.get(STORAGE_STATE_ENV_VAR)
     if env_val:
         try:
-            json.loads(env_val)  # validate it's real JSON before trusting it
+            json.loads(env_val)
             return env_val
         except json.JSONDecodeError:
             print(f"⚠️  {STORAGE_STATE_ENV_VAR} env var is not valid JSON — ignoring")
@@ -38,7 +31,6 @@ def resolve_storage_state_path() -> str | None:
 
 
 def load_netscape_cookies(txt_file: str):
-    """Legacy path — only used if no storage_state is available at all."""
     cookies = []
     with open(txt_file, 'r', encoding='utf-8') as f:
         for line_num, line in enumerate(f, 1):
@@ -88,11 +80,6 @@ async def dump_html(page, filename="page_debug.html"):
 
 
 async def dump_all_frames(page, base_name="page_debug"):
-    """
-    page.content() only returns the main document. If Facebook renders the
-    composer inside a frame, the main-document dump will look empty/wrong
-    for our purposes. This saves one file per frame so we can tell.
-    """
     for i, fr in enumerate(page.frames):
         try:
             html = await fr.content()
@@ -104,7 +91,6 @@ async def dump_all_frames(page, base_name="page_debug"):
 
 
 async def force_tap(page, locator):
-    """Touch-tap → force-click → JS-click fallback chain."""
     box = await locator.bounding_box()
     if box:
         try:
@@ -153,10 +139,6 @@ async def upload_reel(caption: str, video_path: str):
             ]
         )
 
-        # ── Session: prefer storage_state (cookies + localStorage) ────────────
-        # This survives Facebook's token rotation better than a flat cookie
-        # export because it also carries localStorage flags FB uses to
-        # recognize a previously-trusted browser/device.
         storage_state_json = resolve_storage_state_path()
 
         context_kwargs = dict(
@@ -169,8 +151,6 @@ async def upload_reel(caption: str, video_path: str):
             locale="en-US",
             timezone_id="Asia/Karachi",
             accept_downloads=True,
-            # Needed for the real-clipboard Ctrl+V caption-typing fallback.
-            # Harmless if the browser/origin ignores it.
             permissions=["clipboard-read", "clipboard-write"],
         )
 
@@ -188,7 +168,6 @@ async def upload_reel(caption: str, video_path: str):
         context = await browser.new_context(**context_kwargs)
 
         try:
-            # ── Legacy fallback: flat cookie file ──────────────────────────────
             if not using_storage_state:
                 if not Path(COOKIES_TXT).exists():
                     print(f"❌ Neither {STORAGE_STATE_ENV_VAR} env var, {STORAGE_STATE}, "
@@ -203,24 +182,11 @@ async def upload_reel(caption: str, video_path: str):
             await _run_upload_flow(context, caption, video_path)
 
         finally:
-            # ── Always save the (possibly rotated) session before closing ──────
-            # Facebook frequently rotates cookies/tokens during a session.
-            # Capturing the state here — success OR failure — means next
-            # run starts with fresher tokens instead of the original stale
-            # export. We write it to disk ONLY — we do NOT print it to the
-            # workflow logs. GitHub Actions log output is plaintext and can
-            # be visible to anyone with read access to the repo/run, so
-            # printing a live session token there would defeat the purpose
-            # of using a secret in the first place. A separate workflow
-            # step reads this file directly and pushes it back into the
-            # GH secret via `gh secret set`, with the file never logged.
             try:
                 fresh_state = await context.storage_state()
                 Path(STORAGE_STATE).write_text(json.dumps(fresh_state), encoding="utf-8")
                 print(f"\n💾 Saved refreshed storage_state to {STORAGE_STATE} "
                       f"({len(fresh_state.get('cookies', []))} cookies)")
-                print("ℹ️  Refreshed session written to disk only (not printed to logs) — "
-                      "it contains live auth tokens.")
             except Exception as e:
                 print(f"⚠️  Could not save refreshed storage_state: {e}")
 
@@ -228,16 +194,10 @@ async def upload_reel(caption: str, video_path: str):
 
 
 async def _run_upload_flow(context, caption: str, video_path: str):
-    """
-    The actual upload steps, given an already-configured browser context.
-    Browser/context lifecycle (creation, storage_state save, closing) is
-    handled by the caller (upload_reel) so that state-saving always runs
-    via try/finally regardless of where this function returns.
-    """
     page = await context.new_page()
 
-    # ── STEP 1: Load Facebook home (desktop) ──────────────────────────────
-    print("\n🌐 Opening Facebook (desktop)…")
+    # ── STEP 1: Load Facebook ─────────────────────────────────────────────
+    print("\n🌐 Opening Facebook…")
     try:
         await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=60_000)
     except Exception as e:
@@ -246,35 +206,92 @@ async def _run_upload_flow(context, caption: str, video_path: str):
         return
     await asyncio.sleep(8)
     await save_screenshot(page, "01_after_load")
+    print(f"   URL: {page.url}")
 
-    # ── STEP 2: Check login ───────────────────────────────────────────────
-    print("🔍 Checking login…")
-    if "login" in page.url or "checkpoint" in page.url:
-        print("❌ Not logged in — cookies expired")
-        await save_screenshot(page, "02_login_failed")
-        return
+    # ── STEP 2: Login check — handle profile picker ───────────────────────
+    print("🔍 Checking login state…")
 
-    login_ok = False
-    for sel in [
-        '[aria-label="Home"]',
-        '[data-pagelet="LeftRail"]',
-        'div[role="feed"]',
-        '[aria-label="Create"]',
-        'span:has-text("What\'s on your mind?")',
-    ]:
-        if await page.locator(sel).count() > 0:
-            login_ok = True
-            print(f"   ✅ Logged in (via {sel})")
+    # ── 2a: Account Center profile picker (/login/device-based/login/caa/)
+    # This is NOT a real logout. Facebook sees a new device fingerprint but
+    # valid cookies and shows "Continue as [Name]". We must click Continue.
+    # It can appear at the initial load OR after a redirect.
+    for attempt in range(3):
+        current_url = page.url
+        print(f"   URL: {current_url}")
+
+        if 'device-based' in current_url or '/caa/' in current_url or 'login/caa' in current_url:
+            print(f"   ℹ️  Profile picker detected (attempt {attempt+1}) — clicking Continue…")
+            clicked = False
+            for sel in [
+                '[aria-label^="Continue"]',
+                'div[role="button"][aria-label^="Continue"]',
+                'a[aria-label^="Continue"]',
+                'div[role="button"]:has-text("Continue")',
+                'span:has-text("Continue")',
+            ]:
+                try:
+                    btn = page.locator(sel).first
+                    if await btn.count() > 0:
+                        await btn.click(timeout=8_000)
+                        print(f"   ✅ Clicked Continue via: {sel}")
+                        await asyncio.sleep(6)
+                        await save_screenshot(page, f"02{chr(97+attempt)}_after_continue")
+                        clicked = True
+                        break
+                except Exception as e:
+                    print(f"   — {sel}: {e}")
+
+            if not clicked:
+                print("   ❌ Profile picker — could not click Continue")
+                await dump_html(page, "02_picker_failed.html")
+                await save_screenshot(page, "02_picker_failed")
+                return
+            continue  # re-check URL after click
+
+        # ── 2b: Real login wall (no cookies / expired)
+        if '/login' in current_url and 'device-based' not in current_url:
+            print("❌ Not logged in — storage_state cookies are expired")
+            print("   → Export a fresh storage_state.json from Chrome while logged in")
+            await save_screenshot(page, "02_login_failed")
+            return
+
+        # ── 2c: Account checkpoint (suspended/locked)
+        if 'checkpoint' in current_url:
+            print("❌ Account checkpoint — manual intervention required")
+            await save_screenshot(page, "02_checkpoint")
+            return
+
+        # ── 2d: We're on a normal FB page — verify feed elements
+        login_ok = False
+        for sel in [
+            '[aria-label="Home"]',
+            '[data-pagelet="LeftRail"]',
+            'div[role="feed"]',
+            '[aria-label="Create"]',
+            'span:has-text("What\'s on your mind?")',
+            'div[aria-label="Stories"]',
+            'div[aria-label="Reels"]',
+        ]:
+            if await page.locator(sel).count() > 0:
+                login_ok = True
+                print(f"   ✅ Logged in (confirmed: {sel})")
+                break
+
+        if login_ok:
             break
 
-    if not login_ok:
-        print("❌ Login check failed")
+        # Not picker, not login wall, not feed — wait a bit more and retry
+        print(f"   ⏳ Feed not ready yet (attempt {attempt+1}) — waiting…")
+        await asyncio.sleep(5)
+    else:
+        print(f"❌ Login check exhausted — URL: {page.url}")
         await dump_html(page, "02_login_failed.html")
         await save_screenshot(page, "02_login_failed")
         return
+
     await save_screenshot(page, "02_logged_in")
 
-    # ── STEP 3: Navigate to Reels creation (desktop URL) ──────────────────
+    # ── STEP 3: Navigate to Reels creation ───────────────────────────────
     print("\n🎬 Navigating to Reels create page…")
     try:
         await page.goto(
@@ -296,7 +313,6 @@ async def _run_upload_flow(context, caption: str, video_path: str):
 
     uploaded = False
 
-    # Strategy A — set_input_files on hidden input directly
     for sel in ['input[type="file"][accept*="video"]', 'input[type="file"]']:
         try:
             inp = page.locator(sel).first
@@ -309,7 +325,6 @@ async def _run_upload_flow(context, caption: str, video_path: str):
         except Exception as e:
             print(f"   — Direct input failed ({sel}): {e}")
 
-    # Strategy B — click upload button, intercept file chooser dialog
     if not uploaded:
         upload_btn_selectors = [
             'div[role="button"]:has-text("Select video")',
@@ -345,8 +360,8 @@ async def _run_upload_flow(context, caption: str, video_path: str):
         print("❌ Could not attach video — check 04_page_state.html")
         return
 
-    # ── STEP 5: Click "Next" to advance from Create→Edit panel ───────────
-    print("\n➡️  Clicking Next to reach Edit-reel panel (where caption field lives)…")
+    # ── STEP 5: Click "Next" ──────────────────────────────────────────────
+    print("\n➡️  Clicking Next…")
 
     first_next_clicked = False
     for sel in [
@@ -373,16 +388,15 @@ async def _run_upload_flow(context, caption: str, video_path: str):
             print(f"   — {sel}: {e}")
 
     if not first_next_clicked:
-        print("   ⚠️  Could not click first Next — video may still be processing. "
-              "Will still try to find the caption field in case the panel already changed.")
+        print("   ⚠️  Could not click first Next — will still try caption field")
 
     await asyncio.sleep(3)
     await save_screenshot(page, "05a_after_first_next")
 
-    # ── STEP 5b: Poll for the Edit-reel panel / caption field to mount ────
-    print("\n⏳ Waiting for Edit-reel panel (caption field) to appear…")
+    # ── STEP 5b: Wait for caption field ──────────────────────────────────
+    print("\n⏳ Waiting for caption field…")
 
-    CAPTION_FIELD_SELECTOR = 'div[contenteditable="true"][aria-placeholder="Describe your reel..."]'
+    CAPTION_FIELD_SELECTOR       = 'div[contenteditable="true"][aria-placeholder="Describe your reel..."]'
     CAPTION_FIELD_SELECTOR_LOOSE = 'div[contenteditable="true"][aria-placeholder*="Describe your reel" i]'
 
     max_wait = 60
@@ -394,22 +408,17 @@ async def _run_upload_flow(context, caption: str, video_path: str):
         has_field = await page.locator(CAPTION_FIELD_SELECTOR).count() > 0
         if not has_field:
             has_field = await page.locator(CAPTION_FIELD_SELECTOR_LOOSE).count() > 0
-        print(f"   …{elapsed}s — caption field present (aria-placeholder match): {has_field}")
+        print(f"   …{elapsed}s — caption field present: {has_field}")
         if has_field:
             field_ready = True
             break
         await asyncio.sleep(poll_every)
         elapsed += poll_every
 
-    if field_ready:
-        print(f"   ✅ Caption field appeared after {elapsed}s")
-    else:
-        print(f"   ⚠️  Caption field never appeared after {max_wait}s — will still try fallback selectors below")
-
     await save_screenshot(page, "05_after_processing")
     await dump_html(page, "05_page_state.html")
 
-    # ── STEP 6: Enter caption — battery of selectors × battery of methods ──
+    # ── STEP 6: Enter caption ─────────────────────────────────────────────
     print("\n✍️  Entering caption…")
 
     caption_selectors = [
@@ -422,7 +431,7 @@ async def _run_upload_flow(context, caption: str, video_path: str):
         ("aria-label caption",     'div[aria-label*="caption" i][contenteditable="true"]'),
         ("textarea description",  'textarea[placeholder*="description" i]'),
         ("textarea caption",      'textarea[placeholder*="caption" i]'),
-        ("any contenteditable",   'div[contenteditable="true"]'),  # last resort, broadest
+        ("any contenteditable",   'div[contenteditable="true"]'),
     ]
 
     async def verify_caption_present(loc) -> bool:
@@ -481,12 +490,8 @@ async def _run_upload_flow(context, caption: str, video_path: str):
             """(el, text) => {
                 el.focus();
                 el.textContent = text;
-                el.dispatchEvent(new InputEvent('beforeinput', {
-                    bubbles: true, cancelable: true, data: text
-                }));
-                el.dispatchEvent(new InputEvent('input', {
-                    bubbles: true, cancelable: true, data: text
-                }));
+                el.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, cancelable: true, data: text }));
+                el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, data: text }));
                 el.dispatchEvent(new Event('change', { bubbles: true }));
             }""",
             caption,
@@ -502,9 +507,7 @@ async def _run_upload_flow(context, caption: str, video_path: str):
                 el.focus();
                 const dt = new DataTransfer();
                 dt.setData('text/plain', text);
-                const evt = new ClipboardEvent('paste', {
-                    bubbles: true, cancelable: true, clipboardData: dt
-                });
+                const evt = new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: dt });
                 el.dispatchEvent(evt);
             }""",
             caption,
@@ -516,9 +519,7 @@ async def _run_upload_flow(context, caption: str, video_path: str):
         await field.click(timeout=5_000)
         await asyncio.sleep(0.3)
         try:
-            await page.evaluate(
-                "text => navigator.clipboard.writeText(text)", caption
-            )
+            await page.evaluate("text => navigator.clipboard.writeText(text)", caption)
         except Exception as e:
             print(f"         (clipboard.writeText blocked: {e})")
             return False
@@ -527,13 +528,13 @@ async def _run_upload_flow(context, caption: str, video_path: str):
         return await verify_caption_present(field)
 
     methods = [
-        ("keyboard.type",            method_keyboard_type),
-        ("press_sequentially",       method_press_sequentially),
-        ("js-focus + keyboard.type", method_js_focus_then_keyboard),
-        ("execCommand insertText",   method_exec_command),
+        ("keyboard.type",             method_keyboard_type),
+        ("press_sequentially",        method_press_sequentially),
+        ("js-focus + keyboard.type",  method_js_focus_then_keyboard),
+        ("execCommand insertText",    method_exec_command),
         ("direct DOM + input events", method_direct_dom_injection),
-        ("synthetic paste event",    method_paste_event),
-        ("real clipboard Ctrl+V",    method_real_clipboard_paste),
+        ("synthetic paste event",     method_paste_event),
+        ("real clipboard Ctrl+V",     method_real_clipboard_paste),
     ]
 
     caption_typed = False
@@ -549,53 +550,39 @@ async def _run_upload_flow(context, caption: str, video_path: str):
         if count == 0:
             attempt_log.append((sel_name, "—", "not found"))
             continue
-
         try:
             await field.wait_for(state="visible", timeout=5_000)
         except Exception:
             attempt_log.append((sel_name, "—", "found but not visible"))
             continue
-
-        print(f"   🎯 Selector candidate: {sel_name}  ({sel})")
-
+        print(f"   🎯 Selector candidate: {sel_name}")
         for method_name, method_fn in methods:
             try:
-                await field.evaluate(
-                    "el => { el.textContent = ''; el.innerText = ''; }"
-                )
+                await field.evaluate("el => { el.textContent = ''; el.innerText = ''; }")
                 await asyncio.sleep(0.2)
-
                 ok = await method_fn(field)
                 status = "✅ SUCCESS" if ok else "✗ empty after attempt"
                 print(f"      → {method_name}: {status}")
                 attempt_log.append((sel_name, method_name, status))
-
                 if ok:
                     caption_typed = True
                     working_selector = sel_name
                     working_method = method_name
                     break
             except Exception as e:
-                print(f"      → {method_name}: ✗ exception: {e}")
+                print(f"      → {method_name}: ✗ {e}")
                 attempt_log.append((sel_name, method_name, f"exception: {e}"))
 
-    print("\n   📊 Caption attempt summary:")
-    for sel_name, method_name, status in attempt_log:
-        print(f"      [{sel_name}] x [{method_name}] -> {status}")
-
     if caption_typed:
-        print(f"\n   ✅ WORKING COMBINATION FOUND: selector='{working_selector}', "
-              f"method='{working_method}'")
-        await asyncio.sleep(1)
+        print(f"\n   ✅ Caption entered: selector='{working_selector}', method='{working_method}'")
     else:
-        print("\n⚠️  All selector × method combinations failed — continuing to publish anyway")
+        print("\n⚠️  All caption methods failed — continuing to publish anyway")
         await dump_html(page, "06_caption_failed.html")
-        await dump_all_frames(page, "06_caption_failed")
 
     await save_screenshot(page, "06_after_caption")
 
-    # ── STEP 7: Click through any remaining Next steps, then click Post ───
-    print("\n📤 Looking for Next, then the final Post button…")
+    # ── STEP 7: Next → Post ───────────────────────────────────────────────
+    print("\n📤 Looking for Next / Post button…")
 
     for sel in [
         'div[aria-label="Next"][role="button"]',
@@ -610,7 +597,6 @@ async def _run_upload_flow(context, caption: str, video_path: str):
             await btn.wait_for(state="visible", timeout=8_000)
             disabled = await btn.get_attribute("aria-disabled")
             if disabled == "true":
-                print(f"   ⚠️  Next button disabled: {sel}")
                 continue
             ok = await force_tap(page, btn)
             if ok:
@@ -622,126 +608,94 @@ async def _run_upload_flow(context, caption: str, video_path: str):
             print(f"   — Next ({sel}): {e}")
 
     post_selectors = [
-        ("aria-label Post exact",   'div[aria-label="Post"][role="button"]'),
-        ("button text Post exact",  'div[role="button"]:text-is("Post")'),
-        ("span text Post exact",    'span:text-is("Post")'),
-        ("button[type=submit]",     'button[type="submit"]'),
-        ("aria-label Publish",      'div[aria-label="Publish"][role="button"]'),
-        ("aria-label Share now",    'div[aria-label="Share now"][role="button"]'),
-        ("text contains Post",      'div[role="button"]:has-text("Post")'),
-        ("text contains Publish",   'div[role="button"]:has-text("Publish")'),
-        ("text contains Share now", 'div[role="button"]:has-text("Share now")'),
+        ("aria-label Post",    'div[aria-label="Post"][role="button"]'),
+        ("text Post exact",    'div[role="button"]:text-is("Post")'),
+        ("span Post exact",    'span:text-is("Post")'),
+        ("submit button",      'button[type="submit"]'),
+        ("aria-label Publish", 'div[aria-label="Publish"][role="button"]'),
+        ("aria-label Share",   'div[aria-label="Share now"][role="button"]'),
+        ("text Post",          'div[role="button"]:has-text("Post")'),
+        ("text Publish",       'div[role="button"]:has-text("Publish")'),
+        ("text Share now",     'div[role="button"]:has-text("Share now")'),
     ]
 
-    async def click_method_force_tap(loc) -> bool:
-        return await force_tap(page, loc)
+    async def settings_panel_still_open() -> bool:
+        try:
+            return (
+                await page.locator('div[aria-label="Post"][role="button"]').count() > 0
+                or await page.locator('text="Reel settings"').count() > 0
+            )
+        except Exception:
+            return False
 
-    async def click_method_dispatch_event(loc) -> bool:
+    async def click_dispatch(loc) -> bool:
         try:
             await loc.evaluate(
                 """el => {
                     el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-                    el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-                    el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                    el.dispatchEvent(new MouseEvent('mouseup',   { bubbles: true }));
+                    el.dispatchEvent(new MouseEvent('click',     { bubbles: true }));
                 }"""
             )
             return True
         except Exception as e:
-            print(f"      dispatch_event failed: {e}")
+            print(f"      dispatch failed: {e}")
             return False
 
-    async def click_method_keyboard_enter(loc) -> bool:
+    async def click_enter(loc) -> bool:
         try:
             await loc.focus()
             await asyncio.sleep(0.2)
             await page.keyboard.press("Enter")
             return True
         except Exception as e:
-            print(f"      keyboard Enter failed: {e}")
+            print(f"      Enter failed: {e}")
             return False
 
     click_methods = [
-        ("force_tap (touch/force-click/JS chain)", click_method_force_tap),
-        ("synthetic mouse event dispatch",          click_method_dispatch_event),
-        ("focus + keyboard Enter",                  click_method_keyboard_enter),
+        ("force_tap",         lambda loc: force_tap(page, loc)),
+        ("dispatch events",   click_dispatch),
+        ("focus + Enter",     click_enter),
     ]
 
-    async def settings_panel_still_open() -> bool:
-        try:
-            still_has_post_btn = await page.locator(
-                'div[aria-label="Post"][role="button"]'
-            ).count() > 0
-            still_has_heading = await page.locator(
-                'text="Reel settings"'
-            ).count() > 0
-            return still_has_post_btn or still_has_heading
-        except Exception:
-            return False
-
     post_clicked = False
-    post_attempt_log = []
-
     for sel_name, sel in post_selectors:
         if post_clicked:
             break
         btn = page.locator(sel).last
-        count = await btn.count()
-        if count == 0:
-            post_attempt_log.append((sel_name, "—", "not found"))
+        if await btn.count() == 0:
             continue
-
         try:
             await btn.wait_for(state="visible", timeout=5_000)
         except Exception:
-            post_attempt_log.append((sel_name, "—", "found but not visible"))
             continue
-
-        disabled = await btn.get_attribute("aria-disabled")
-        if disabled == "true":
-            post_attempt_log.append((sel_name, "—", "disabled"))
+        if await btn.get_attribute("aria-disabled") == "true":
             continue
-
-        print(f"   🎯 Selector candidate: {sel_name}  ({sel})")
-
+        print(f"   🎯 Post button candidate: {sel_name}")
         for method_name, method_fn in click_methods:
             try:
                 still_open_before = await settings_panel_still_open()
                 ok = await method_fn(btn)
                 await asyncio.sleep(2)
                 still_open_after = await settings_panel_still_open()
-
                 if ok and still_open_before and not still_open_after:
-                    status = "✅ SUCCESS (panel closed)"
-                    print(f"      → {method_name}: {status}")
-                    post_attempt_log.append((sel_name, method_name, status))
+                    print(f"      → {method_name}: ✅ SUCCESS")
                     post_clicked = True
                     break
                 elif ok:
-                    status = "⚠️ click fired but panel still open"
-                    print(f"      → {method_name}: {status}")
-                    post_attempt_log.append((sel_name, method_name, status))
+                    print(f"      → {method_name}: ⚠️ fired but panel still open")
                 else:
-                    status = "✗ click failed"
-                    print(f"      → {method_name}: {status}")
-                    post_attempt_log.append((sel_name, method_name, status))
+                    print(f"      → {method_name}: ✗")
             except Exception as e:
-                print(f"      → {method_name}: ✗ exception: {e}")
-                post_attempt_log.append((sel_name, method_name, f"exception: {e}"))
+                print(f"      → {method_name}: ✗ {e}")
 
-    print("\n   📊 Post-button attempt summary:")
-    for sel_name, method_name, status in post_attempt_log:
-        print(f"      [{sel_name}] x [{method_name}] -> {status}")
-
-    if post_clicked:
-        print("\n   ✅ Post button click confirmed (settings panel closed)")
-    else:
-        print("\n⚠️  Could not confirm Post button click — check 07_post_failed.html / screenshot")
+    if not post_clicked:
+        print("\n⚠️  Could not confirm Post click")
         await dump_html(page, "07_post_failed.html")
-
     await save_screenshot(page, "07_after_post_attempt")
 
-    # ── STEP 8: Wait and confirm ──────────────────────────────────────────
-    print("\n⏳ Waiting for reel to publish (25 s)…")
+    # ── STEP 8: Confirm ───────────────────────────────────────────────────
+    print("\n⏳ Waiting 25 s for publish…")
     await asyncio.sleep(25)
     await save_screenshot(page, "08_final_result")
     await dump_html(page, "08_final_page.html")
