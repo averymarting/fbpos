@@ -1,0 +1,38 @@
+name: Facebook Reel Upload (Loop)
+
+on:
+  workflow_dispatch:
+    inputs:
+      gdrive_upload_folder_id:
+        description: "Google Drive folder ID holding pending videos"
+        required: true
+        type: string
+
+jobs:
+  upload-reel-loop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install playwright gspread google-auth google-auth-httplib2 google-api-python-client oauth2client
+          playwright install chromium --with-deps
+
+      - name: Run upload loop
+        env:
+          TZ: "Asia/Karachi"
+          FB_STORAGE_STATE: ${{ secrets.FB_STORAGE_STATE }}
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          GDRIVE_UPLOAD_FOLDER_ID: ${{ inputs.gdrive_upload_folder_id }}
+          GOOGLE_SHEET_ID: "1ICgS97JJ-Hrs9qsI1UV-xJvPg7ovmSHStGQPoOYr0Dk"
+        run: |
+          timeout $((355*60)) python fbpostnow.py || true
