@@ -1,12 +1,9 @@
-import asyncio, io, json, os, random, time
+import asyncio, io, json, os, random
 from pathlib import Path
-from datetime import datetime
-from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request
+from google.oauth2.service_account import Credentials as ServiceAccountCredentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
 from playwright.async_api import async_playwright
 
 # ─────────────────────────────────────────────
@@ -14,12 +11,15 @@ from playwright.async_api import async_playwright
 # ─────────────────────────────────────────────
 STORAGE_STATE = "storage_state.json"
 UPLOADED_JSON = Path("uploaded.json")
-SCREENSHOTS_DIR = Path("screenshots")
 
 GDRIVE_UPLOAD_FOLDER_ENV = "GDRIVE_UPLOAD_FOLDER_ID"
 GOOGLE_SHEET_ID_ENV = "GOOGLE_SHEET_ID"
 
-VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+# One scope list covering both Drive (read) and Sheets/Drive metadata (gspread)
+SCOPES = [
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/spreadsheets",
+]
 
 # ─────────────────────────────────────────────
 # Helpers
@@ -38,13 +38,29 @@ def already_uploaded(file_id):
     uploaded = json.loads(UPLOADED_JSON.read_text())
     return uploaded.get(file_id, False)
 
+def load_service_account_credentials():
+    """
+    GOOGLE_CREDENTIALS_JSON must be a *service account key* JSON
+    (has "type": "service_account", "client_email", "private_key", ...).
+    Share both the Drive folder and the Google Sheet with that client_email.
+    """
+    creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+    if not creds_json:
+        raise RuntimeError("GOOGLE_CREDENTIALS_JSON env var is missing")
+    creds_data = json.loads(creds_json)
+    if creds_data.get("type") != "service_account":
+        raise RuntimeError(
+            f"GOOGLE_CREDENTIALS_JSON has type={creds_data.get('type')!r}, "
+            "expected a service_account key. Generate one in Google Cloud "
+            "Console (IAM & Admin > Service Accounts > Keys) and share your "
+            "Drive folder + Sheet with its client_email."
+        )
+    return ServiceAccountCredentials.from_service_account_info(creds_data, scopes=SCOPES)
+
 # ─────────────────────────────────────────────
 # Google Drive
 # ─────────────────────────────────────────────
-def build_drive_service():
-    creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
-    creds_data = json.loads(creds_json)
-    creds = Credentials.from_authorized_user_info(creds_data)
+def build_drive_service(creds):
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 def gdrive_list_videos(service, folder_id: str):
@@ -57,29 +73,28 @@ def gdrive_list_videos(service, folder_id: str):
     ).execute()
     return result.get("files", [])
 
-def gdrive_download_video(service, file_id: str, file_name: str, dest_dir: str):
+def gdrive_download_video(service, file_id: str, dest_dir: str):
     dest_path = os.path.join(dest_dir, random_fb_filename())
     request = service.files().get_media(fileId=file_id)
     with io.FileIO(dest_path, "wb") as fh:
-        downloader = MediaIoBaseDownload(fh, request, chunksize=8*1024*1024)
+        downloader = MediaIoBaseDownload(fh, request, chunksize=8 * 1024 * 1024)
         done = False
         while not done:
-            status, done = downloader.next_chunk()
+            _status, done = downloader.next_chunk()
     return dest_path
 
 # ─────────────────────────────────────────────
 # Google Sheets
 # ─────────────────────────────────────────────
-def get_caption_and_url():
+def get_caption_and_url(creds):
     sheet_id = os.environ.get(GOOGLE_SHEET_ID_ENV)
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
-    creds_data = json.loads(creds_json)
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_data, scope)
     client = gspread.authorize(creds)
 
     sheet = client.open_by_key(sheet_id).sheet1
     rows = sheet.get_all_records()
+
+    if not rows:
+        raise RuntimeError("Sheet1 has no data rows")
 
     # Expect headers: caption, urls
     caption_template = rows[0]["caption"]
@@ -102,31 +117,51 @@ def get_caption_and_url():
 async def upload_reel(caption: str, video_path: str):
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context()
+
+        # Load the logged-in Facebook session written from the FB_STORAGE_STATE
+        # secret. Without this, Playwright opens reels/create/ logged OUT.
+        if Path(STORAGE_STATE).exists():
+            context = await browser.new_context(storage_state=STORAGE_STATE)
+        else:
+            raise RuntimeError(
+                f"{STORAGE_STATE} not found — the FB_STORAGE_STATE secret was "
+                "not written to disk before the script ran."
+            )
+
         page = await context.new_page()
         await page.goto("https://www.facebook.com/reels/create/")
         await page.locator('input[type="file"]').set_input_files(video_path)
         await asyncio.sleep(5)
         await page.keyboard.type(caption)
         await asyncio.sleep(5)
+        # NOTE: this still doesn't click "Publish" — add that selector once
+        # you've confirmed the flow manually.
         await browser.close()
 
 # ─────────────────────────────────────────────
 # Main Loop
 # ─────────────────────────────────────────────
 async def main():
-    service = build_drive_service()
+    creds = load_service_account_credentials()
+    drive_service = build_drive_service(creds)
+
     folder_id = os.environ.get(GDRIVE_UPLOAD_FOLDER_ENV)
-    videos = gdrive_list_videos(service, folder_id)
+    if not folder_id:
+        raise RuntimeError("GDRIVE_UPLOAD_FOLDER_ID env var is missing")
+
+    videos = gdrive_list_videos(drive_service, folder_id)
+    if not videos:
+        print("No videos found in the Drive folder.")
+        return
 
     for v in videos:
         if already_uploaded(v["id"]):
             continue
-        local_path = gdrive_download_video(service, v["id"], v["name"], ".")
-        caption = get_caption_and_url()
+        local_path = gdrive_download_video(drive_service, v["id"], ".")
+        caption = get_caption_and_url(creds)
         await upload_reel(caption, local_path)
         mark_uploaded(v["id"])
-        await asyncio.sleep(60)  # interval from sheet can be added here
+        await asyncio.sleep(60)
 
 if __name__ == "__main__":
     asyncio.run(main())
