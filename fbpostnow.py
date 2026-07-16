@@ -254,10 +254,20 @@ def sheets_get_caption() -> str | None:
         warn("Sheet has no data rows")
         return None
 
-    caption_template = str(rows[0].get("caption", "")).strip()
-    if not caption_template:
-        warn("First row has no 'caption' value")
+    # The full caption is every non-empty 'caption' cell, in row order,
+    # joined into one multi-line post — this sheet stores the hook line,
+    # story lines, and hashtags as separate rows that all belong to the
+    # same final caption.
+    caption_lines = [
+        str(row.get("caption", "")).strip()
+        for row in rows
+        if str(row.get("caption", "")).strip()
+    ]
+    if not caption_lines:
+        warn("No non-empty 'caption' cells found")
         return None
+    caption_template = "\n".join(caption_lines)
+    info(f"Combined {len(caption_lines)} caption row(s) into one post ({len(caption_template)} chars)")
 
     urls = [str(row["urls"]).strip() for row in rows if row.get("urls")]
     if not urls:
@@ -1148,8 +1158,7 @@ def run_once():
 
     caption = sheets_get_caption()
     if not caption:
-        caption = gdrive_get_caption(service)
-    if not caption:
+        warn("Google Sheet caption unavailable — falling back to local captions.txt/default")
         cap_path = Path(CAPTIONS_TXT)
         if cap_path.exists():
             caption = cap_path.read_text(encoding="utf-8").strip()
