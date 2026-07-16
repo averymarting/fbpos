@@ -61,7 +61,11 @@ def load_google_credentials():
         return ServiceAccountCredentials.from_service_account_info(creds_data, scopes=SCOPES)
 
     if "refresh_token" in creds_data:
-        return UserCredentials.from_authorized_user_info(creds_data, scopes=SCOPES)
+        # Use whatever scopes this token was actually granted at consent
+        # time — requesting a scope it doesn't have (e.g. our SCOPES
+        # constant adding "spreadsheets") makes the refresh call fail with
+        # invalid_scope.
+        return UserCredentials.from_authorized_user_info(creds_data)
 
     raise RuntimeError(
         "GOOGLE_CREDENTIALS_JSON doesn't look like a service account key "
