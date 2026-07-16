@@ -131,6 +131,9 @@ def get_caption_and_url(creds):
 # Upload Flow (simplified)
 # ─────────────────────────────────────────────
 async def upload_reel(caption: str, video_path: str):
+    debug_dir = Path("debug")
+    debug_dir.mkdir(exist_ok=True)
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
 
@@ -145,13 +148,43 @@ async def upload_reel(caption: str, video_path: str):
             )
 
         page = await context.new_page()
-        await page.goto("https://www.facebook.com/reels/create/")
-        await page.locator('input[type="file"]').set_input_files(video_path)
+        await page.goto("https://www.facebook.com/reels/create/", wait_until="networkidle")
+        await asyncio.sleep(3)  # let any client-side redirect / dialog settle
+
+        current_url = page.url
+        print(f"[debug] landed on: {current_url}")
+
+        # Bail out early with a clear message if we got bounced to a login/checkpoint page
+        if "login" in current_url or "checkpoint" in current_url:
+            await page.screenshot(path=str(debug_dir / "not_logged_in.png"), full_page=True)
+            (debug_dir / "not_logged_in.html").write_text(await page.content())
+            await browser.close()
+            raise RuntimeError(
+                f"Facebook redirected to {current_url} instead of the reel "
+                "composer — the storage_state session is expired/invalid. "
+                "Re-export FB_STORAGE_STATE from a fresh logged-in session. "
+                "Screenshot + HTML saved to debug/ for inspection."
+            )
+
+        try:
+            await page.locator('input[type="file"]').set_input_files(video_path, timeout=60000)
+        except Exception:
+            await page.screenshot(path=str(debug_dir / "file_input_not_found.png"), full_page=True)
+            (debug_dir / "file_input_not_found.html").write_text(await page.content())
+            await browser.close()
+            raise RuntimeError(
+                f"Could not find the file input on {current_url}. "
+                "Screenshot + HTML saved to debug/ — check for a cookie "
+                "consent banner, a 'Create' button that must be clicked "
+                "first, or the input being inside an iframe."
+            )
+
         await asyncio.sleep(5)
         await page.keyboard.type(caption)
         await asyncio.sleep(5)
         # NOTE: this still doesn't click "Publish" — add that selector once
         # you've confirmed the flow manually.
+        await page.screenshot(path=str(debug_dir / "before_publish.png"), full_page=True)
         await browser.close()
 
 # ─────────────────────────────────────────────
