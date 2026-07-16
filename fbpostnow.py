@@ -1,6 +1,7 @@
 import asyncio, io, json, os, random
 from pathlib import Path
 from google.oauth2.service_account import Credentials as ServiceAccountCredentials
+from google.oauth2.credentials import Credentials as UserCredentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 import gspread
@@ -38,24 +39,35 @@ def already_uploaded(file_id):
     uploaded = json.loads(UPLOADED_JSON.read_text())
     return uploaded.get(file_id, False)
 
-def load_service_account_credentials():
+def load_google_credentials():
     """
-    GOOGLE_CREDENTIALS_JSON must be a *service account key* JSON
-    (has "type": "service_account", "client_email", "private_key", ...).
-    Share both the Drive folder and the Google Sheet with that client_email.
+    Accepts GOOGLE_CREDENTIALS_JSON in either of two formats:
+
+    1. Service account key: {"type": "service_account", "client_email": ..., "private_key": ...}
+       -> share the Drive folder + Sheet with client_email.
+
+    2. OAuth "authorized user" token: {"token": ..., "refresh_token": ...,
+       "client_id": ..., "client_secret": ..., "token_uri": ...}
+       -> this is a token for whichever Google account you personally
+          consented with; that account must already have access to the
+          folder/sheet (no separate sharing step needed).
     """
     creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
     if not creds_json:
         raise RuntimeError("GOOGLE_CREDENTIALS_JSON env var is missing")
     creds_data = json.loads(creds_json)
-    if creds_data.get("type") != "service_account":
-        raise RuntimeError(
-            f"GOOGLE_CREDENTIALS_JSON has type={creds_data.get('type')!r}, "
-            "expected a service_account key. Generate one in Google Cloud "
-            "Console (IAM & Admin > Service Accounts > Keys) and share your "
-            "Drive folder + Sheet with its client_email."
-        )
-    return ServiceAccountCredentials.from_service_account_info(creds_data, scopes=SCOPES)
+
+    if creds_data.get("type") == "service_account":
+        return ServiceAccountCredentials.from_service_account_info(creds_data, scopes=SCOPES)
+
+    if "refresh_token" in creds_data:
+        return UserCredentials.from_authorized_user_info(creds_data, scopes=SCOPES)
+
+    raise RuntimeError(
+        "GOOGLE_CREDENTIALS_JSON doesn't look like a service account key "
+        "(needs \"type\": \"service_account\") or an OAuth authorized-user "
+        "token (needs a \"refresh_token\" field)."
+    )
 
 # ─────────────────────────────────────────────
 # Google Drive
@@ -142,7 +154,7 @@ async def upload_reel(caption: str, video_path: str):
 # Main Loop
 # ─────────────────────────────────────────────
 async def main():
-    creds = load_service_account_credentials()
+    creds = load_google_credentials()
     drive_service = build_drive_service(creds)
 
     folder_id = os.environ.get(GDRIVE_UPLOAD_FOLDER_ENV)
